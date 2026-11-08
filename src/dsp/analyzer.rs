@@ -102,7 +102,7 @@ fn kernel<const L: usize, const BP: bool, const MET: bool>(
     let mut lz2: [f32; L] = std::array::from_fn(|c| bank.lz2[c]);
     let mut ab = [0.0f32; L];
     let mut af = [0.0f32; L];
-    for frame in data.chunks_exact(L) {
+    for frame in data.as_chunks::<L>().0 {
         for c in 0..L {
             let x = frame[c];
             if MET {
@@ -412,7 +412,9 @@ impl Analyzer {
                     let mut buf = [0.0f32; CHUNK * MAX_CHANNELS];
                     let n = self.n;
                     for (dst, frame) in buf
-                        .chunks_exact_mut(MAX_CHANNELS)
+                        .as_chunks_mut::<MAX_CHANNELS>()
+                        .0
+                        .iter_mut()
                         .zip(src.chunks_exact(stride))
                     {
                         for c in 0..n {
