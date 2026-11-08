@@ -1,8 +1,12 @@
-name: CI
+name: Build SoundSight
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # publish the "latest" release
 
 jobs:
   windows:
@@ -12,21 +16,45 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
         run: cargo test
       - name: DSP benchmark
         run: cargo run --release --example bench_dsp
-      - name: Release build
-        run: cargo build --release
-      - name: Binary size
+
+      - name: Release build (static CRT, single exe)
+        run: cargo build --release --bin SoundSight
+
+      - name: Verify the exe has no non-system DLL dependencies
         shell: pwsh
-        run: "'{0:N0} bytes' -f (Get-Item target/release/soundsight.exe).Length"
+        run: |
+          $exe = "target/release/SoundSight.exe"
+          '{0:N0} bytes' -f (Get-Item $exe).Length
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /nologo /dependents $exe
+          $deps
+          $bad = $deps | Select-String -Pattern 'VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase' 
+          if ($bad) { Write-Error "Exe depends on the VC++ runtime: $bad"; exit 1 }
+          $imports = & $dumpbin.FullName /nologo /imports $exe
+          $banned = $imports | Select-String -Pattern 'OpenProcess|ReadProcessMemory|WriteProcessMemory|CreateRemoteThread|VirtualAllocEx|SetWindowsHookEx'
+          if ($banned) { Write-Error "Banned API imported: $banned"; exit 1 }
+          "OK: only Windows system DLLs, no process-access or hook APIs."
+
       - uses: actions/upload-artifact@v4
         with:
-          name: soundsight-windows-x64
-          path: |
-            target/release/soundsight.exe
-            soundsight.default.toml
-            README.md
+          name: SoundSight
+          path: target/release/SoundSight.exe
+          if-no-files-found: error
+
+      - name: Publish "latest" release
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>$null
+          $notes = "Built from ${{ github.ref_name }} @ ${{ github.sha }}. Single exe: download SoundSight.exe and run it. No install, no runtime needed."
+          gh release create latest target/release/SoundSight.exe --title "SoundSight (latest build)" --notes $notes --prerelease --target ${{ github.sha }}

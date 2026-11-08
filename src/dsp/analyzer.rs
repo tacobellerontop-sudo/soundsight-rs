@@ -6,15 +6,23 @@
 //!   2. subtract a per-channel adaptive noise floor (slow rise / fast fall), so
 //!      constant sounds (music, ambience, wind) fade out of the picture
 //!   3. reject the block unless it is `snr_db` above the floor
-//!   4. energy-vector direction + loudness (dBFS -> 0..1 intensity)
-//!   5. optional heuristics (centre-heavy / unfocused -> suppress)
-//!   6. deposit into a circular histogram of `BINS` directions; bins decay exponentially
+//!   4. common-mode removal: subtract the quietest active channel from all of them.
+//!      Your own footsteps/gunfire play in every channel at about the same level; an
+//!      enemy adds energy to one or two channels on top. What remains is the enemy.
+//!   5. group adjacent speakers into sources (strongest channel + its two
+//!      neighbours), so two sounds from different sides show as two bars
+//!   6. energy-vector direction + loudness (dBFS -> 0..1 intensity) per source
+//!   7. optional heuristics (centre-heavy / unfocused -> suppress)
+//!   8. deposit into a circular histogram of `BINS` directions; bins decay exponentially
+//!
+//! On surround devices it also notices when only FL/FR ever carry sound (a stereo
+//! game played through a 7.1 device) and then maps FL/FR to hard left/right.
 //!
 //! No heap allocation: every buffer is a fixed-size array inside the struct.
 
 use super::biquad::Biquad;
 use super::direction::{angle_to_bins, estimate, DirectionEstimate};
-use super::layout::{Layout, MAX_CHANNELS};
+use super::layout::{Layout, Speaker, MAX_CHANNELS};
 use crate::config::Config;
 
 /// Number of radar directions (10 degrees each).
@@ -79,6 +87,24 @@ pub struct Analyzer {
     max_center_ratio: f32,
     min_focus: f32,
 
+    subtract_common: bool,
+    cluster_min_frac: f32,
+    /// Active channels sorted by angle (a ring), for finding neighbours. Two rings:
+    /// the real layout and the stereo fallback (FL/FR only).
+    ring: [usize; MAX_CHANNELS],
+    ring_len: usize,
+    stereo_ring: [usize; MAX_CHANNELS],
+    stereo_ring_len: usize,
+    stereo_vectors: [(f32, f32); MAX_CHANNELS],
+
+    /// Stereo-content-on-surround-device detection.
+    auto_stereo: bool,
+    stereo_content: bool,
+    front_avg: f32,
+    rest_avg: f32,
+    active_time: f32,
+    mode_a: f32,
+
     decay_tau_s: f32,
     decay_per_block: f32,
     bins: [f32; BINS],
@@ -86,7 +112,30 @@ pub struct Analyzer {
     /// Full-band mean square per channel with peak-hold style release, for the calibration meter.
     meters: [f32; MAX_CHANNELS],
 
+    /// Strongest source found in the last block (for tests and debugging).
     pub last_event: Option<Event>,
+    /// Number of sources found in the last block.
+    pub last_event_count: usize,
+}
+
+/// Time constant for the stereo-content detector's averages.
+const MODE_TAU_S: f32 = 2.0;
+/// Seconds of active (non-silent) audio needed before switching to stereo mapping.
+const MODE_MIN_ACTIVE_S: f32 = 1.5;
+
+/// Channel indices sorted clockwise by angle; channels without direction are left out.
+fn build_ring(vectors: &[(f32, f32)], n: usize) -> ([usize; MAX_CHANNELS], usize) {
+    let mut ring = [0usize; MAX_CHANNELS];
+    let mut len = 0;
+    for c in 0..n {
+        if vectors[c] != (0.0, 0.0) {
+            ring[len] = c;
+            len += 1;
+        }
+    }
+    let angle = |c: usize| vectors[c].0.atan2(vectors[c].1);
+    ring[..len].sort_unstable_by(|&a, &b| angle(a).total_cmp(&angle(b)));
+    (ring, len)
 }
 
 impl Analyzer {
@@ -98,6 +147,23 @@ impl Analyzer {
         let coef = |tau: f32| 1.0 - (-block_dt / tau).exp();
         let floor0 = db_to_energy(d.min_db);
         let tau = d.decay_ms / 1000.0;
+        let n = layout.analysed_channels();
+        let (ring, ring_len) = build_ring(&layout.vectors, n);
+        // Stereo fallback: FL hard left, FR hard right, everything else ignored.
+        let mut stereo_vectors = [(0.0f32, 0.0f32); MAX_CHANNELS];
+        let fl = layout.speakers[..n]
+            .iter()
+            .position(|&s| s == Speaker::FrontLeft);
+        let fr = layout.speakers[..n]
+            .iter()
+            .position(|&s| s == Speaker::FrontRight);
+        if let (Some(l), Some(r)) = (fl, fr) {
+            stereo_vectors[l] = (-1.0, 0.0);
+            stereo_vectors[r] = (1.0, 0.0);
+        }
+        let (stereo_ring, stereo_ring_len) = build_ring(&stereo_vectors, n);
+        // Only meaningful when the layout has more than the front pair.
+        let auto_stereo = d.auto_stereo && fl.is_some() && fr.is_some() && ring_len > 2;
         Analyzer {
             stride: layout.channels.max(1),
             n: layout.analysed_channels(),
@@ -118,11 +184,25 @@ impl Analyzer {
             heur_enabled: cfg.heuristics.enabled,
             max_center_ratio: cfg.heuristics.max_center_ratio,
             min_focus: cfg.heuristics.min_focus,
+            subtract_common: d.subtract_common,
+            cluster_min_frac: d.cluster_min_frac,
+            ring,
+            ring_len,
+            stereo_ring,
+            stereo_ring_len,
+            stereo_vectors,
+            auto_stereo,
+            stereo_content: false,
+            front_avg: 0.0,
+            rest_avg: 0.0,
+            active_time: 0.0,
+            mode_a: 1.0 - (-block_dt / MODE_TAU_S).exp(),
             decay_tau_s: tau,
             decay_per_block: (-block_dt / tau).exp(),
             bins: [0.0; BINS],
             meters: [0.0; MAX_CHANNELS],
             last_event: None,
+            last_event_count: 0,
             layout,
         }
     }
@@ -133,6 +213,12 @@ impl Analyzer {
 
     pub fn block_seconds(&self) -> f32 {
         self.block_dt
+    }
+
+    /// True while a surround device is carrying stereo-only content and FL/FR are
+    /// being mapped to hard left/right.
+    pub fn stereo_content(&self) -> bool {
+        self.stereo_content
     }
 
     /// Feed interleaved frames. `data.len()` should be a multiple of the channel count;
@@ -226,32 +312,124 @@ impl Analyzer {
 
         self.decay_bins(self.decay_per_block);
         self.last_event = None;
+        self.last_event_count = 0;
 
-        if total <= floor_total * self.snr_lin || total <= f32::MIN_POSITIVE {
+        let active = total > floor_total * self.snr_lin && total > f32::MIN_POSITIVE;
+        if self.auto_stereo && active {
+            self.update_stereo_detector(&energy);
+        }
+        if !active {
             return;
         }
-        let Some(dir) = estimate(&eff[..n], &self.layout.vectors[..n]) else {
-            return;
+
+        let (vectors, ring, ring_len) = if self.stereo_content {
+            (self.stereo_vectors, self.stereo_ring, self.stereo_ring_len)
+        } else {
+            (self.layout.vectors, self.ring, self.ring_len)
         };
-
-        let db = energy_to_db(dir.total);
-        let intensity = ((db - self.min_db) / (self.max_db - self.min_db)).clamp(0.0, 1.0);
-        if intensity <= 0.0 {
+        let ring = &ring[..ring_len];
+        if ring.is_empty() {
             return;
         }
 
-        if self.heur_enabled {
-            let center: f32 = (0..n)
-                .filter(|&c| self.layout.is_center[c])
-                .map(|c| eff[c])
-                .sum();
-            if center / dir.total > self.max_center_ratio || dir.focus < self.min_focus {
-                return;
+        // Common-mode removal ("filter my own sounds").
+        let mut resid = [0.0f32; MAX_CHANNELS];
+        let common = if self.subtract_common {
+            ring.iter().map(|&c| eff[c]).fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
+        let mut peak = 0.0f32;
+        for &c in ring {
+            resid[c] = (eff[c] - common).max(0.0);
+            peak = peak.max(resid[c]);
+        }
+        if peak <= 0.0 {
+            return;
+        }
+
+        // Greedy source grouping: strongest remaining channel + its ring neighbours.
+        let mut used = [false; MAX_CHANNELS];
+        for _ in 0..ring_len {
+            let mut best = None;
+            for (i, &c) in ring.iter().enumerate() {
+                if !used[c]
+                    && resid[c] > 0.0
+                    && best.is_none_or(|(_, b): (usize, usize)| resid[c] > resid[b])
+                {
+                    best = Some((i, c));
+                }
+            }
+            let Some((i, c)) = best else { break };
+            if resid[c] < peak * self.cluster_min_frac {
+                break;
+            }
+            let mut members = [c, usize::MAX, usize::MAX];
+            used[c] = true;
+            if ring_len > 1 {
+                let left = ring[(i + ring_len - 1) % ring_len];
+                let right = ring[(i + 1) % ring_len];
+                for (k, nb) in [left, right].into_iter().enumerate() {
+                    if !used[nb] && resid[nb] > 0.0 {
+                        used[nb] = true;
+                        members[k + 1] = nb;
+                    }
+                }
+            }
+
+            let mut e = [0.0f32; MAX_CHANNELS];
+            for &m in members.iter().filter(|&&m| m != usize::MAX) {
+                e[m] = resid[m];
+            }
+            let Some(dir) = estimate(&e[..n], &vectors[..n]) else {
+                continue;
+            };
+            let db = energy_to_db(dir.total);
+            let intensity = ((db - self.min_db) / (self.max_db - self.min_db)).clamp(0.0, 1.0);
+            if intensity <= 0.0 {
+                continue;
+            }
+            if self.heur_enabled {
+                let center: f32 = (0..n)
+                    .filter(|&k| self.layout.is_center[k])
+                    .map(|k| e[k])
+                    .sum();
+                if center / dir.total > self.max_center_ratio || dir.focus < self.min_focus {
+                    continue;
+                }
+            }
+            if self.last_event.is_none() {
+                self.last_event = Some(Event { dir, intensity });
+            }
+            self.last_event_count += 1;
+            self.deposit(dir.angle_deg, intensity);
+        }
+    }
+
+    /// Decide whether a surround device is carrying stereo-only content.
+    fn update_stereo_detector(&mut self, energy: &[f32; MAX_CHANNELS]) {
+        let (mut front, mut rest) = (0.0f32, 0.0f32);
+        for c in 0..self.n {
+            if self.stereo_vectors[c] != (0.0, 0.0) {
+                front += energy[c];
+            } else if self.layout.vectors[c] != (0.0, 0.0) {
+                rest += energy[c];
             }
         }
+        let a = self.mode_a;
+        self.front_avg += a * (front - self.front_avg);
+        self.rest_avg += a * (rest - self.rest_avg);
+        self.active_time = (self.active_time + self.block_dt).min(60.0);
 
-        self.last_event = Some(Event { dir, intensity });
-        self.deposit(dir.angle_deg, intensity);
+        if self.stereo_content {
+            // Leave immediately when a clearly surround sound shows up.
+            if rest > 0.3 * front || self.rest_avg > 0.1 * self.front_avg {
+                self.stereo_content = false;
+                self.active_time = 0.0;
+            }
+        } else if self.active_time >= MODE_MIN_ACTIVE_S && self.rest_avg < 0.03 * self.front_avg {
+            self.stereo_content = true;
+        }
     }
 
     fn deposit(&mut self, angle_deg: f32, intensity: f32) {
@@ -428,6 +606,110 @@ mod tests {
         let mut b = analyzer(8, 0x63F, &cfg);
         b.process(&tone(&amps, 50));
         assert!(b.last_event.is_some());
+    }
+
+    #[test]
+    fn own_sound_in_all_channels_does_not_hide_enemy() {
+        // You walking: every directional channel at the same level. Enemy on your left
+        // adds energy to SL only. (FL FR C LFE BL BR SL SR)
+        let mut cfg = Config::default();
+        let own = 0.2;
+        let amps = [own, own, own, 0.0, own, own, 0.26, own];
+        let mut a = analyzer(8, 0x63F, &cfg);
+        a.process(&tone(&amps, 60));
+        let ev = a.last_event.expect("enemy over own footsteps");
+        assert!(
+            normalize_deg(ev.dir.angle_deg + 90.0).abs() < 1.0,
+            "{}",
+            ev.dir.angle_deg
+        );
+        assert_eq!(
+            a.last_event_count, 1,
+            "only the enemy, no bars for your own sound"
+        );
+
+        // Without common-mode removal your own sound shows up as extra phantom bars.
+        cfg.detection.subtract_common = false;
+        let mut b = analyzer(8, 0x63F, &cfg);
+        b.process(&tone(&amps, 60));
+        assert!(
+            b.last_event_count > 1,
+            "own sound should leak through without subtraction"
+        );
+    }
+
+    #[test]
+    fn own_sound_alone_shows_nothing() {
+        let cfg = Config::default();
+        let mut a = analyzer(8, 0x63F, &cfg);
+        a.process(&tone(&[0.2, 0.2, 0.2, 0.0, 0.2, 0.2, 0.2, 0.2], 60));
+        assert!(a.bins().iter().all(|&b| b == 0.0));
+    }
+
+    #[test]
+    fn two_simultaneous_sources_give_two_bars() {
+        let cfg = Config::default();
+        let mut a = analyzer(8, 0x63F, &cfg);
+        // FR (30) and BL (-150) at once.
+        a.process(&tone(&[0.0, 0.3, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0], 60));
+        assert_eq!(a.last_event_count, 2);
+        let lit = |deg: f32| {
+            let (lo, hi, _) = angle_to_bins(deg, BINS);
+            a.bins()[lo].max(a.bins()[hi]) > 0.3
+        };
+        assert!(lit(30.0) && lit(-150.0), "{:?}", a.bins());
+        assert!(!lit(-60.0), "no phantom source in between");
+    }
+
+    #[test]
+    fn stereo_centered_own_sound_plus_enemy_left() {
+        let cfg = Config::default();
+        let mut a = analyzer(2, 0x3, &cfg);
+        // Own sound 0.2 in both, enemy adds a bit on the left.
+        a.process(&tone(&[0.26, 0.2], 60));
+        let ev = a.last_event.expect("left excess is shown");
+        assert!(normalize_deg(ev.dir.angle_deg + 90.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn stereo_game_through_7_1_device_is_detected() {
+        let cfg = Config::default();
+        let mut a = analyzer(8, 0x63F, &cfg);
+        // Stereo game on a 7.1 device: only FL/FR ever carry sound.
+        let alternating = [
+            tone(&[0.3, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100),
+            tone(&[0.05, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100),
+        ];
+        for i in 0..30 {
+            a.process(&alternating[i % 2]);
+        }
+        assert!(a.stereo_content(), "should switch to stereo mapping");
+        a.process(&tone(&[0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 60));
+        let ev = a.last_event.unwrap();
+        assert!(
+            normalize_deg(ev.dir.angle_deg + 90.0).abs() < 1.0,
+            "FL-only = hard left, got {}",
+            ev.dir.angle_deg
+        );
+
+        // A real surround sound switches straight back.
+        a.process(&tone(&[0.0, 0.0, 0.0, 0.0, 0.4, 0.4, 0.0, 0.0], 30));
+        assert!(!a.stereo_content());
+    }
+
+    #[test]
+    fn real_7_1_game_stays_surround() {
+        let cfg = Config::default();
+        let mut a = analyzer(8, 0x63F, &cfg);
+        for i in 0..40 {
+            let amps = if i % 4 == 3 {
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.3]
+            } else {
+                [0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            };
+            a.process(&tone(&amps, 100));
+        }
+        assert!(!a.stereo_content());
     }
 
     #[test]

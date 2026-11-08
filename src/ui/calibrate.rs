@@ -187,7 +187,9 @@ unsafe fn paint(hwnd: HWND) {
                 dc,
                 12,
                 30,
-                if layout.has_rear() {
+                if layout.has_rear() && sh.stereo_content.load(Relaxed) {
+                    "Stereo-only content detected: FL/FR shown as hard left/right."
+                } else if layout.has_rear() {
                     "Front/back separation available."
                 } else {
                     "No rear channels: only left/right can be shown (see README: Voicemeeter 7.1)."

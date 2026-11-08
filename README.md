@@ -7,7 +7,19 @@ edges: **position = direction, length/opacity = loudness (a rough closeness cue)
 
 It is designed to run next to a competitive FPS without costing frames:
 event-driven capture, no polling, zero heap allocation in the audio path, redraws
-only when something changes, plain GDI (no GPU API), about 600 KB on disk.
+only when something changes, plain GDI (no GPU API), well under 1 MB on disk.
+
+## Download
+
+**One file, nothing to install:** download `SoundSight.exe` from the
+[latest release](../../releases/tag/latest) (or the `SoundSight` artifact of the
+newest *Build SoundSight* run under the Actions tab) and run it.
+
+- No Python, no .NET, no Visual C++ Redistributable: the C runtime is linked
+  statically, and CI checks that the exe only depends on DLLs built into Windows.
+- On first start it creates `soundsight.toml` next to itself (put the exe in a
+  folder you can write to, e.g. `Documents\SoundSight`, not `Program Files`).
+- Windows SmartScreen may warn because the exe is unsigned: *More info → Run anyway*.
 
 > [!WARNING]
 > **Check Riot's policy before using this in Valorant.** SoundSight was built to
@@ -43,9 +55,12 @@ playing the sound, and it works the same with a YouTube video.
   Re-initialises automatically when the headset is unplugged or the default device
   changes.
 - **Direction:** per-channel band-passed energy (200 Hz-4 kHz, two biquads) over 10 ms
-  blocks → energy-weighted vector sum of the speaker directions → angle + loudness.
-  Adaptive per-channel noise floor, fade-out smoothing, optional "probably my own
-  sound / music" heuristics.
+  blocks → adaptive noise floor → **own-sound removal** (subtract the level common to
+  all channels) → group adjacent speakers into sources → energy-weighted vector sum per
+  source → angle + loudness. Several simultaneous sounds show as separate bars.
+- **Stereo games on a 7.1 device** (e.g. CS2 through Voicemeeter) are detected
+  automatically: FL/FR are then shown as hard left/right instead of front-left/right.
+- **Bars grow longer, thicker and more opaque** as sounds get louder (closer).
 - **Overlay:** four thin edge strips on the primary monitor, click-through, never takes
   focus, redrawn only on change, capped at 60 Hz by default.
 - **Tray icon:** Show overlay, Calibrate / speaker test, Edit config, Reload config, Quit.
@@ -67,7 +82,7 @@ playing the sound, and it works the same with a YouTube video.
 cargo build --release
 ```
 
-4. Run `target\release\soundsight.exe`. A tray icon appears and `soundsight.toml` is
+4. Run `target\release\SoundSight.exe`. A tray icon appears and `soundsight.toml` is
    written next to the exe. Put the exe in a folder you can write to (not
    `Program Files`), otherwise the config file can't be created and defaults are used.
 
@@ -165,13 +180,17 @@ identical to the built-in defaults). Highlights:
 | `general.hotkey` | `"F10"` | e.g. `"Ctrl+Shift+S"`, `"Alt+F9"`, `"Win+F8"` |
 | `general.refresh_hz` | `60` | Redraw cap. Nothing redraws while nothing changes. |
 | `general.mmcss` | `false` | Register the capture thread with MMCSS "Games". |
-| `overlay.thickness` / `bar_length` | `6` / `240` | Pixels (physical). |
+| `overlay.thickness` / `min_thickness_frac` | `12` / `0.4` | Bar thickness for the loudest sounds; quiet ones get 40% of it. |
+| `overlay.bar_length` | `240` | Pixels (physical) at full intensity. |
 | `overlay.opacity` / `color` | `0.9` / `"#FF3B30"` | |
 | `detection.band_low_hz` / `band_high_hz` | `200` / `4000` | Band-pass for footsteps/gunshots. `bandpass = false` uses full band. |
 | `detection.min_db` / `max_db` | `-60` / `-18` | Band energy (dBFS) mapped to intensity 0..1. |
 | `detection.snr_db` | `6` | How far above the adaptive noise floor a sound must be. |
 | `detection.decay_ms` | `250` | Fade time. Raise to reduce flicker, lower for snappier bars. |
-| `heuristics.enabled` | `true` | Suppress centre-heavy / directionless sounds. |
+| `detection.subtract_common` | `true` | "Filter my own sounds": remove the level shared by all channels. |
+| `detection.cluster_min_frac` | `0.25` | A second simultaneous sound must have ≥25% of the strongest one's energy. |
+| `detection.auto_stereo` | `true` | Detect stereo-only content on a 5.1/7.1 device. |
+| `heuristics.enabled` | `true` | Also suppress centre-heavy / directionless sounds. |
 | `speakers.*` | 30/90/150/110/90 | Speaker angles (front, side, back, 5.1 surround pair, stereo). |
 
 ---
@@ -231,6 +250,25 @@ Only three direct dependencies:
   hundred lines of plain Win32.
 
 ### Why these DSP choices
+
+The own-sound removal, per-speaker sources, stereo-through-7.1 detection and
+"thicker when closer" bars follow the approach of
+[z1netdin/SoundSight](https://github.com/z1netdin/SoundSight) (a Python app by a deaf
+FPS player, tested in Valorant 7.1 and CS2 stereo). They are reimplemented here with
+the same zero-allocation, block-based design:
+
+- **Own-sound removal:** in Valorant your own footsteps and gun play in *every*
+  channel at a similar level; an enemy adds energy to one or two channels on top.
+  Subtracting the quietest active channel from all channels leaves only that extra
+  energy. Without it, "own sound + enemy" becomes a diffuse mix and the enemy is lost.
+- **Sources instead of one vector:** the strongest remaining channel plus its two
+  neighbouring speakers form one source (energy vector gives the angle between them);
+  repeat for what's left. Two enemies on different sides give two bars instead of one
+  bar pointing at neither of them.
+- **Stereo content on a surround device:** if over ~1.5 s of activity only FL/FR carry
+  sound, FL/FR are remapped to ±90°. Unlike a per-block check, a real 7.1 game's
+  frontal sounds aren't misread as left/right; any clear surround sound switches back
+  immediately.
 
 - **Biquads, not an FFT:** we only need energy in one band per channel. Two biquads per
   channel are about 10 multiply-adds per sample. The whole 7.1 pipeline measures
@@ -298,7 +336,7 @@ Measured in the Linux development container, since no Windows machine was availa
 |---|---|---|
 | DSP cost, 7.1 @ 48 kHz, band-pass on | **~0.12% of one core** | `cargo run --release --example bench_dsp` |
 | Heap allocations in the audio hot path | **0** | `tests/no_alloc.rs` (counting global allocator around `process`/`tick`/`publish`) |
-| Release binary (x86_64-pc-windows-gnu) | **594 KB** | mingw cross build; CI prints the MSVC size |
+| Release binary (x86_64-pc-windows-gnu) | **~600 KB** | mingw cross build; CI prints the MSVC (static CRT) size |
 
 **Not yet measured on Windows:** total process CPU (DSP + WASAPI + GDI + DWM
 interaction), RAM, and GPU. By design I expect well under 1% CPU and roughly
@@ -348,9 +386,11 @@ deathmatch; (4) overlay hidden (capture is stopped, so this should be ~0).
 - **Loudness is not distance.** Intensity is band energy in dBFS. It moves with your
   in-game and Windows volume: if you change volume a lot, adjust
   `detection.min_db`/`max_db`.
-- **The heuristics are guesses.** "Centre-heavy or directionless" catches many of your
-  own sounds (footsteps, gunfire, ability voice lines) and centred music, but will also
-  sometimes hide an enemy straight ahead. Turn it off with `heuristics.enabled = false`.
+- **Own-sound removal is a heuristic.** It assumes your own sounds are roughly equal in
+  all channels. An enemy exactly as loud in every channel would be removed too, and an
+  own sound that is louder in front still leaves some residue. The centre-heavy
+  heuristic can hide an enemy straight ahead; turn it off with
+  `heuristics.enabled = false`, or own-sound removal with `detection.subtract_common = false`.
 - **Borderless windowed only.** Exclusive fullscreen hides all overlays. In borderless
   mode, any top-most layered window over the game can make Windows compose the game
   instead of using independent flip/MPO, which may add up to a frame of display latency

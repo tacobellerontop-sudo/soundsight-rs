@@ -475,6 +475,9 @@ fn pump(
             return Exit::DeviceLost;
         }
 
+        shared
+            .stereo_content
+            .store(analyzer.stereo_content(), Relaxed);
         analyzer.quantized_bins(&mut qbins);
         analyzer.quantized_meters(&mut qmeters);
         if shared.publish(&qbins, &qmeters) && !shared.redraw_pending.swap(true, AcqRel) {

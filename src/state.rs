@@ -17,6 +17,8 @@ pub struct Shared {
     pub sample_rate: AtomicU32,
     /// True while capture is running on a device.
     pub capturing: AtomicBool,
+    /// Surround device carrying stereo-only content (FL/FR mapped to hard left/right).
+    pub stereo_content: AtomicBool,
     /// Overlay visible or calibration window open -> capture should run.
     pub wanted: AtomicBool,
     /// A redraw message is queued and not yet handled.
@@ -37,6 +39,7 @@ impl Shared {
             channel_mask: AtomicU32::new(0),
             sample_rate: AtomicU32::new(0),
             capturing: AtomicBool::new(false),
+            stereo_content: AtomicBool::new(false),
             wanted: AtomicBool::new(true),
             redraw_pending: AtomicBool::new(false),
             notify_hwnd: AtomicIsize::new(0),

@@ -43,8 +43,12 @@ impl Default for General {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Overlay {
-    /// Bar thickness in physical pixels (also the thickness of the edge windows).
+    /// Bar thickness in physical pixels for the loudest sounds (also the thickness of
+    /// the edge windows).
     pub thickness: u32,
+    /// Quietest visible sound gets this fraction of `thickness` (0..1). Bars grow
+    /// thicker as sounds get louder/closer.
+    pub min_thickness_frac: f32,
     /// Bar length in pixels at full intensity.
     pub bar_length: u32,
     /// Fraction of `bar_length` shown for the quietest visible sound (0..1).
@@ -62,7 +66,8 @@ pub struct Overlay {
 impl Default for Overlay {
     fn default() -> Self {
         Overlay {
-            thickness: 6,
+            thickness: 12,
+            min_thickness_frac: 0.4,
             bar_length: 240,
             min_length_frac: 0.3,
             opacity: 0.9,
@@ -93,6 +98,15 @@ pub struct Detection {
     pub floor_fall_s: f32,
     /// Bar fade-out time constant in ms.
     pub decay_ms: f32,
+    /// Subtract the quietest channel from all channels before finding directions.
+    /// Removes sounds that play equally everywhere (your own footsteps/gun).
+    pub subtract_common: bool,
+    /// A second, simultaneous sound is shown only if it has at least this fraction
+    /// of the strongest sound's energy (0..1).
+    pub cluster_min_frac: f32,
+    /// On 5.1/7.1 devices, detect stereo-only content (e.g. CS2 through Voicemeeter)
+    /// and map FL/FR to hard left/right.
+    pub auto_stereo: bool,
 }
 
 impl Default for Detection {
@@ -108,6 +122,9 @@ impl Default for Detection {
             floor_rise_s: 3.0,
             floor_fall_s: 0.3,
             decay_ms: 250.0,
+            subtract_common: true,
+            cluster_min_frac: 0.25,
+            auto_stereo: true,
         }
     }
 }
@@ -129,7 +146,7 @@ impl Default for Heuristics {
     fn default() -> Self {
         Heuristics {
             enabled: true,
-            max_center_ratio: 0.6,
+            max_center_ratio: 0.75,
             min_focus: 0.15,
         }
     }
@@ -176,6 +193,7 @@ impl Config {
         o.thickness = o.thickness.clamp(1, 64);
         o.bar_length = o.bar_length.clamp(4, 4000);
         o.min_length_frac = o.min_length_frac.clamp(0.0, 1.0);
+        o.min_thickness_frac = o.min_thickness_frac.clamp(0.0, 1.0);
         o.opacity = o.opacity.clamp(0.0, 1.0);
         o.min_opacity_frac = o.min_opacity_frac.clamp(0.0, 1.0);
         o.min_intensity = o.min_intensity.clamp(0.0, 1.0);
@@ -190,6 +208,7 @@ impl Config {
         d.floor_rise_s = d.floor_rise_s.max(0.01);
         d.floor_fall_s = d.floor_fall_s.max(0.01);
         d.decay_ms = d.decay_ms.clamp(10.0, 5000.0);
+        d.cluster_min_frac = d.cluster_min_frac.clamp(0.0, 1.0);
         let h = &mut self.heuristics;
         h.max_center_ratio = h.max_center_ratio.clamp(0.0, 1.0);
         h.min_focus = h.min_focus.clamp(0.0, 1.0);

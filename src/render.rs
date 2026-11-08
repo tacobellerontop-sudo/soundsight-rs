@@ -100,6 +100,7 @@ pub struct Style {
     pub bar_length: f32,
     pub min_length_frac: f32,
     pub min_intensity: f32,
+    pub min_thickness_frac: f32,
 }
 
 impl Style {
@@ -112,6 +113,7 @@ impl Style {
             bar_length: o.bar_length as f32,
             min_length_frac: o.min_length_frac,
             min_intensity: o.min_intensity,
+            min_thickness_frac: o.min_thickness_frac,
         }
     }
 
@@ -121,6 +123,13 @@ impl Style {
         let a8 = (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
         let pm = |c: u8| (c as u32 * a8 + 127) / 255;
         (a8 << 24) | (pm(self.rgb.0) << 16) | (pm(self.rgb.1) << 8) | pm(self.rgb.2)
+    }
+
+    /// Bar thickness in pixels for a strip of maximum thickness `t`: thin when quiet/far,
+    /// full strip thickness when loud/close.
+    pub fn thickness(&self, intensity: f32, t: i32) -> i32 {
+        let f = self.min_thickness_frac + (1.0 - self.min_thickness_frac) * intensity;
+        ((t as f32 * f).round() as i32).clamp(1, t)
     }
 
     pub fn length(&self, intensity: f32) -> f32 {
@@ -152,8 +161,8 @@ pub fn paint_frame(
         }
         let center = layout.angle_to_perimeter(bin_center_deg(i, BINS));
         let half = style.length(intensity) / 2.0;
-        let px = style.pixel(intensity);
-        paint_interval(layout, bufs, center - half, center + half, px, &mut drawn);
+        let bar = (style.pixel(intensity), style.thickness(intensity, layout.t));
+        paint_interval(layout, bufs, center - half, center + half, bar, &mut drawn);
     }
 
     let mut changed = [false; 4];
@@ -170,28 +179,30 @@ fn paint_interval(
     bufs: &mut [&mut [u32]; 4],
     a: f32,
     b: f32,
-    px: u32,
+    bar: (u32, i32),
     drawn: &mut [bool; 4],
 ) {
     let p = l.perimeter();
     let len = (b - a).min(p);
     let a = a.rem_euclid(p);
     let b = a + len;
-    paint_segment(l, bufs, a, b.min(p), px, drawn);
+    paint_segment(l, bufs, a, b.min(p), bar, drawn);
     if b > p {
-        paint_segment(l, bufs, 0.0, b - p, px, drawn);
+        paint_segment(l, bufs, 0.0, b - p, bar, drawn);
     }
 }
 
-/// Paint [a, b) with 0 <= a <= b <= perimeter.
+/// Paint [a, b) with 0 <= a <= b <= perimeter. `bar` = (pixel, thickness); bars hug
+/// the outer screen edge and grow inwards.
 fn paint_segment(
     l: &EdgeLayout,
     bufs: &mut [&mut [u32]; 4],
     a: f32,
     b: f32,
-    px: u32,
+    bar: (u32, i32),
     drawn: &mut [bool; 4],
 ) {
+    let (px, th) = bar;
     let (w, h, t) = (l.w as f32, l.h as f32, l.t);
     // (edge, perimeter start, perimeter end)
     let edges = [
@@ -216,11 +227,14 @@ fn paint_segment(
         let (lo, hi) = (lo.round() as i32, hi.round() as i32);
         let rect = l.strip_rect(edge);
         let buf = &mut *bufs[edge];
+        let (sw, sh) = (rect.2, rect.3);
         let painted = match edge {
-            // Horizontal strip: lo..hi are x; fill all t rows.
-            TOP | BOTTOM => fill(buf, rect.2, rect.3, lo, hi, 0, rect.3, px),
-            // Vertical strip: lo..hi are screen y; strip starts at y = t.
-            _ => fill(buf, rect.2, rect.3, 0, rect.2, lo - t, hi - t, px),
+            // Horizontal strips: lo..hi are x. Outer edge is row 0 (top) / last row (bottom).
+            TOP => fill(buf, sw, sh, lo, hi, 0, th, px),
+            BOTTOM => fill(buf, sw, sh, lo, hi, sh - th, sh, px),
+            // Vertical strips: lo..hi are screen y; the strip starts at y = t.
+            RIGHT => fill(buf, sw, sh, sw - th, sw, lo - t, hi - t, px),
+            _ => fill(buf, sw, sh, 0, th, lo - t, hi - t, px),
         };
         drawn[edge] |= painted;
     }
@@ -364,6 +378,33 @@ mod tests {
             "idle: nothing to push"
         );
         assert!(bufs[RIGHT].iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn louder_bars_are_thicker_and_hug_the_edge() {
+        let style = Style::from_config(&Config::default());
+        let t = 12;
+        assert_eq!(style.thickness(1.0, t), 12);
+        assert_eq!(style.thickness(0.0, t), 5); // 40% of 12, rounded
+        let lay = EdgeLayout {
+            w: 1920,
+            h: 1080,
+            t,
+        };
+        let mut v: [Vec<u32>; 4] = std::array::from_fn(|e| vec![0u32; lay.strip_len(e)]);
+        let mut has = [false; 4];
+        let mut bins = [0u8; BINS];
+        bins[0] = 30; // quiet sound straight ahead -> thin bar on the top strip
+        let [a, b, c, d] = &mut v;
+        let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
+        paint_frame(&lay, &style, &bins, &mut bufs, &mut has);
+        let col = 960usize;
+        assert_ne!(bufs[TOP][col], 0, "outer row painted");
+        assert_eq!(
+            bufs[TOP][11 * 1920 + col],
+            0,
+            "inner row not painted for a quiet sound"
+        );
     }
 
     #[test]
