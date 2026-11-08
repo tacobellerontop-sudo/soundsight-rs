@@ -1,0 +1,49 @@
+[package]
+name = "soundsight-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Visual sound radar overlay for deaf and hard-of-hearing gamers (WASAPI loopback only)"
+license = "MIT"
+default-run = "soundsight"
+
+[lib]
+name = "soundsight"
+path = "src/lib.rs"
+
+[[bin]]
+name = "soundsight"
+path = "src/main.rs"
+
+[dependencies]
+# Config parsing. No default features: we only need to *parse* TOML into structs.
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+
+# Microsoft's official Win32/COM bindings. Only the feature-gated modules below are compiled.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
