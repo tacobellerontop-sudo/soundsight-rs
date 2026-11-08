@@ -62,6 +62,9 @@ pub struct General {
     pub refresh_hz: u32,
     /// Register the capture thread with MMCSS ("Games" task). Off by default; see README.
     pub mmcss: bool,
+    /// While audio plays, read it every 20 ms instead of on every 10 ms engine event:
+    /// half the wakeups, bars may appear up to 10 ms later.
+    pub power_saving: bool,
 }
 
 impl Default for General {
@@ -71,6 +74,7 @@ impl Default for General {
             start_visible: true,
             refresh_hz: 60,
             mmcss: false,
+            power_saving: false,
         }
     }
 }
@@ -300,6 +304,9 @@ start_visible = {sv}
 refresh_hz = {rhz}
 # Register the capture thread with MMCSS ("Games" task). Off by default (see README).
 mmcss = {mmcss}
+# Read audio every 20 ms instead of every 10 ms while it plays: half the wakeups,
+# bars may appear up to 10 ms later.
+power_saving = {ps}
 
 [overlay]
 # "edges", "edges_front_back" (sides + separate front/behind bars) or "circle".
@@ -369,6 +376,7 @@ stereo = {sst:?}
             sv = g.start_visible,
             rhz = g.refresh_hz,
             mmcss = g.mmcss,
+            ps = g.power_saving,
             style = q(o.style.key()),
             cr = o.circle_radius,
             cg = o.circle_guide_opacity,

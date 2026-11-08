@@ -36,17 +36,121 @@ use crate::config::Config;
 /// Number of radar directions (10 degrees each).
 pub const BINS: usize = 36;
 
+/// Frames processed per inner-loop run. Formats that need repacking use a stack
+/// buffer of `CHUNK * MAX_CHANNELS` floats (8 KB), never the heap.
+const CHUNK: usize = 256;
+
+/// The band-pass for all channels at once: one coefficient set (every channel uses
+/// the same filter), per-channel state in fixed lanes so the compiler can keep a whole
+/// frame in SIMD registers (2 lanes for stereo, 6 for 5.1, 8 for 7.1).
+#[derive(Clone, Copy)]
+struct FilterBank {
+    hp: [f32; 5],
+    lp: [f32; 5],
+    hz1: [f32; MAX_CHANNELS],
+    hz2: [f32; MAX_CHANNELS],
+    lz1: [f32; MAX_CHANNELS],
+    lz2: [f32; MAX_CHANNELS],
+}
+
+impl FilterBank {
+    fn new(sr: f32, low: f32, high: f32) -> FilterBank {
+        FilterBank {
+            hp: Biquad::highpass(sr, low).coefs(),
+            lp: Biquad::lowpass(sr, high).coefs(),
+            hz1: [0.0; MAX_CHANNELS],
+            hz2: [0.0; MAX_CHANNELS],
+            lz1: [0.0; MAX_CHANNELS],
+            lz2: [0.0; MAX_CHANNELS],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.hz1 = [0.0; MAX_CHANNELS];
+        self.hz2 = [0.0; MAX_CHANNELS];
+        self.lz1 = [0.0; MAX_CHANNELS];
+        self.lz2 = [0.0; MAX_CHANNELS];
+    }
+
+    /// Zero tiny states so silence never decays into (slow) denormal floats.
+    fn flush_denormals(&mut self) {
+        for z in [&mut self.hz1, &mut self.hz2, &mut self.lz1, &mut self.lz2] {
+            for v in z.iter_mut() {
+                if v.abs() < 1e-15 {
+                    *v = 0.0;
+                }
+            }
+        }
+    }
+}
+
+/// The hot loop. `data` holds whole frames of exactly `L` interleaved channels.
+/// Accumulates band-passed (`BP`) energy and, if `MET`, full-band energy per lane.
+#[inline(always)]
+fn kernel<const L: usize, const BP: bool, const MET: bool>(
+    bank: &mut FilterBank,
+    acc_band: &mut [f32; MAX_CHANNELS],
+    acc_full: &mut [f32; MAX_CHANNELS],
+    data: &[f32],
+) {
+    let [hb0, hb1, hb2, ha1, ha2] = bank.hp;
+    let [lb0, lb1, lb2, la1, la2] = bank.lp;
+    // Work on local copies so the state stays in registers for the whole run.
+    let mut hz1: [f32; L] = std::array::from_fn(|c| bank.hz1[c]);
+    let mut hz2: [f32; L] = std::array::from_fn(|c| bank.hz2[c]);
+    let mut lz1: [f32; L] = std::array::from_fn(|c| bank.lz1[c]);
+    let mut lz2: [f32; L] = std::array::from_fn(|c| bank.lz2[c]);
+    let mut ab = [0.0f32; L];
+    let mut af = [0.0f32; L];
+    for frame in data.chunks_exact(L) {
+        for c in 0..L {
+            let x = frame[c];
+            if MET {
+                af[c] += x * x;
+            }
+            let y = if BP {
+                // Two transposed direct form II biquads: 200 Hz HP then 4 kHz LP.
+                let y1 = hb0 * x + hz1[c];
+                hz1[c] = hb1 * x - ha1 * y1 + hz2[c];
+                hz2[c] = hb2 * x - ha2 * y1;
+                let y2 = lb0 * y1 + lz1[c];
+                lz1[c] = lb1 * y1 - la1 * y2 + lz2[c];
+                lz2[c] = lb2 * y1 - la2 * y2;
+                y2
+            } else {
+                x
+            };
+            ab[c] += y * y;
+        }
+    }
+    bank.hz1[..L].copy_from_slice(&hz1);
+    bank.hz2[..L].copy_from_slice(&hz2);
+    bank.lz1[..L].copy_from_slice(&lz1);
+    bank.lz2[..L].copy_from_slice(&lz2);
+    for c in 0..L {
+        acc_band[c] += ab[c];
+        acc_full[c] += af[c];
+    }
+}
+
 /// Bins/meters below this are treated as zero (also stops endless tiny decays).
 const ZERO: f32 = 1.0 / 512.0;
 
 /// Interleaved sample formats we accept from WASAPI.
 pub trait Sample: Copy {
     fn to_f32(self) -> f32;
+    /// Zero-copy view for the common case (shared-mode mix format is f32).
+    fn as_f32(_s: &[Self]) -> Option<&[f32]> {
+        None
+    }
 }
 impl Sample for f32 {
     #[inline(always)]
     fn to_f32(self) -> f32 {
         self
+    }
+    fn as_f32(s: &[f32]) -> Option<&[f32]> {
+        Some(s)
     }
 }
 impl Sample for i16 {
@@ -75,8 +179,12 @@ pub struct Analyzer {
     n: usize,
 
     bandpass: bool,
-    hp: [Biquad; MAX_CHANNELS],
-    lp: [Biquad; MAX_CHANNELS],
+    bank: FilterBank,
+    /// Compute the full-band per-channel meters (only needed by the speaker test).
+    meters_on: bool,
+    /// Bins fading below this are dropped (they are not drawn anyway), so fades end
+    /// sooner and invisible changes never trigger a redraw.
+    min_intensity: f32,
 
     acc_band: [f32; MAX_CHANNELS],
     acc_full: [f32; MAX_CHANNELS],
@@ -205,8 +313,9 @@ impl Analyzer {
             stride: layout.channels.max(1),
             n: layout.analysed_channels(),
             bandpass: d.bandpass,
-            hp: [Biquad::highpass(sr, d.band_low_hz); MAX_CHANNELS],
-            lp: [Biquad::lowpass(sr, d.band_high_hz); MAX_CHANNELS],
+            bank: FilterBank::new(sr, d.band_low_hz, d.band_high_hz),
+            meters_on: true,
+            min_intensity: cfg.overlay.min_intensity.max(ZERO),
             acc_band: [0.0; MAX_CHANNELS],
             acc_full: [0.0; MAX_CHANNELS],
             count: 0,
@@ -272,30 +381,49 @@ impl Analyzer {
         self.own_hold_left > 0
     }
 
+    /// Turn the speaker-test meters on/off (saves work while Settings is closed).
+    pub fn set_meters(&mut self, on: bool) {
+        if self.meters_on != on {
+            self.meters_on = on;
+            self.meters = [0.0; MAX_CHANNELS];
+            self.acc_full = [0.0; MAX_CHANNELS];
+        }
+    }
+
     /// Feed interleaved frames. `data.len()` should be a multiple of the channel count;
     /// a trailing partial frame is ignored. Returns the number of blocks completed.
-    #[inline]
     pub fn process<S: Sample>(&mut self, data: &[S]) -> usize {
-        let mut blocks = 0;
-        let n = self.n;
-        for frame in data.chunks_exact(self.stride) {
-            let frame = &frame[..n];
-            if self.bandpass {
-                for c in 0..n {
-                    let x = frame[c].to_f32();
-                    self.acc_full[c] += x * x;
-                    let y = self.lp[c].process(self.hp[c].process(x));
-                    self.acc_band[c] += y * y;
-                }
-            } else {
-                for c in 0..n {
-                    let x = frame[c].to_f32();
-                    let e = x * x;
-                    self.acc_full[c] += e;
-                    self.acc_band[c] += e;
+        let stride = self.stride;
+        let frames = data.len() / stride;
+        let (mut done, mut blocks) = (0, 0);
+        while done < frames {
+            let run = (frames - done)
+                .min(self.block_frames - self.count)
+                .min(CHUNK);
+            let src = &data[done * stride..(done + run) * stride];
+            match (S::as_f32(src), stride) {
+                (Some(f), 1) => self.run_lanes::<1>(f),
+                (Some(f), 2) => self.run_lanes::<2>(f),
+                (Some(f), 4) => self.run_lanes::<4>(f),
+                (Some(f), 6) => self.run_lanes::<6>(f),
+                (Some(f), 8) => self.run_lanes::<8>(f),
+                _ => {
+                    // More than 8 channels or integer samples: repack into 8 lanes.
+                    let mut buf = [0.0f32; CHUNK * MAX_CHANNELS];
+                    let n = self.n;
+                    for (dst, frame) in buf
+                        .chunks_exact_mut(MAX_CHANNELS)
+                        .zip(src.chunks_exact(stride))
+                    {
+                        for c in 0..n {
+                            dst[c] = frame[c].to_f32();
+                        }
+                    }
+                    self.run_lanes::<8>(&buf[..run * MAX_CHANNELS]);
                 }
             }
-            self.count += 1;
+            self.count += run;
+            done += run;
             if self.count >= self.block_frames {
                 self.finish_block();
                 blocks += 1;
@@ -304,14 +432,21 @@ impl Analyzer {
         blocks
     }
 
+    fn run_lanes<const L: usize>(&mut self, data: &[f32]) {
+        let (b, a, f) = (&mut self.bank, &mut self.acc_band, &mut self.acc_full);
+        match (self.bandpass, self.meters_on) {
+            (true, false) => kernel::<L, true, false>(b, a, f, data),
+            (true, true) => kernel::<L, true, true>(b, a, f, data),
+            (false, false) => kernel::<L, false, false>(b, a, f, data),
+            (false, true) => kernel::<L, false, true>(b, a, f, data),
+        }
+    }
+
     /// Account for `frames` frames of digital silence (WASAPI AUDCLNT_BUFFERFLAGS_SILENT)
     /// without touching the sample data.
     pub fn process_silence(&mut self, mut frames: usize) -> usize {
         let mut blocks = 0;
-        for c in 0..self.n {
-            self.hp[c].reset();
-            self.lp[c].reset();
-        }
+        self.bank.reset();
         while frames > 0 {
             let take = frames.min(self.block_frames - self.count);
             self.count += take;
@@ -339,10 +474,9 @@ impl Analyzer {
             let full = self.acc_full[c] * inv;
             self.acc_band[c] = 0.0;
             self.acc_full[c] = 0.0;
-            self.hp[c].flush_denormals();
-            self.lp[c].flush_denormals();
-
-            self.meters[c] = full.max(self.meters[c] * meter_release);
+            if self.meters_on {
+                self.meters[c] = full.max(self.meters[c] * meter_release);
+            }
             energy[c] = e;
 
             let floor = self.floor[c];
@@ -361,6 +495,7 @@ impl Analyzer {
             }
         }
 
+        self.bank.flush_denormals();
         self.decay_bins(self.decay_per_block);
         self.last_event = None;
         self.last_event_count = 0;
@@ -529,9 +664,10 @@ impl Analyzer {
     }
 
     fn decay_bins(&mut self, factor: f32) {
+        let cut = self.min_intensity;
         for b in &mut self.bins {
             *b *= factor;
-            if *b < ZERO {
+            if *b < cut {
                 *b = 0.0;
             }
         }

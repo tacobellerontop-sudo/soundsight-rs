@@ -71,6 +71,11 @@ impl Biquad {
         }
     }
 
+    /// Coefficients (b0, b1, b2, a1, a2), normalised so a0 = 1.
+    pub fn coefs(&self) -> [f32; 5] {
+        [self.b0, self.b1, self.b2, self.a1, self.a2]
+    }
+
     #[inline(always)]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;

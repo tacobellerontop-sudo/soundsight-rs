@@ -21,8 +21,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
         run: cargo test
-      - name: DSP benchmark
-        run: cargo run --release --example bench_dsp
+      - name: Benchmarks (DSP + pipeline)
+        run: |
+          cargo run --release --example bench_dsp
+          cargo run --release --example bench_pipeline
 
       - name: Release build (static CRT, single exe)
         run: cargo build --release --bin SoundSight

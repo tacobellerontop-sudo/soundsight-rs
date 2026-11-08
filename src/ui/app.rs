@@ -46,6 +46,12 @@ const HOTKEY_ID: i32 = 1;
 /// Controller timers.
 const TIMER_SAVE: usize = 1;
 const TIMER_PREVIEW: usize = 2;
+const TIMER_IDLE_HIDE: usize = 3;
+/// Take the overlay windows off the screen after this long without anything to draw.
+const IDLE_HIDE_MS: u32 = 1500;
+/// Fade-outs (nothing new, bars only getting dimmer) are drawn at most this often;
+/// new or louder sounds use the full refresh rate.
+const FADE_HZ: u32 = 30;
 const SAVE_DELAY_MS: u32 = 600;
 const PREVIEW_MS: u64 = 2000;
 
@@ -71,6 +77,9 @@ struct App {
     last_frame: Instant,
     timer: HANDLE,
     timer_armed: bool,
+    /// The armed frame timer is for a "rising" (fast) frame.
+    timer_fast: bool,
+    idle_hide_armed: bool,
     taskbar_created: u32,
 }
 
@@ -95,6 +104,20 @@ pub fn run() {
         }
         // Physical pixels, so the strips line up with the real screen edges.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // The UI thread only paints a few bars: mark it as efficiency work (EcoQoS), so
+        // on hybrid CPUs Windows prefers the E-cores and leaves the P-cores to the game.
+        // (The capture thread keeps normal QoS for timely wakeups.)
+        let eco = THREAD_POWER_THROTTLING_STATE {
+            Version: 1, // THREAD_POWER_THROTTLING_CURRENT_VERSION
+            ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        };
+        let _ = SetThreadInformation(
+            GetCurrentThread(),
+            ThreadPowerThrottling,
+            &eco as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        );
         if let Err(e) = init() {
             let msg = wide(&format!("SoundSight failed to start:\n{e}"));
             MessageBoxW(None, PCWSTR(msg.as_ptr()), w!("SoundSight"), MB_ICONERROR);
@@ -217,6 +240,8 @@ fn init() -> Result<()> {
             last_frame: Instant::now(),
             timer,
             timer_armed: false,
+            timer_fast: false,
+            idle_hide_armed: false,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         };
         app.register_hotkey(&cfg);
@@ -225,11 +250,21 @@ fn init() -> Result<()> {
             app.tray.balloon("SoundSight config error", &e, true);
         }
         APP.with(|a| *a.borrow_mut() = Some(app));
+        trim_working_set();
         // `SoundSight.exe --settings` opens the settings window right away.
         if std::env::args().any(|a| a.eq_ignore_ascii_case("--settings")) {
             with_app(|a| a.open_settings());
         }
         Ok(())
+    }
+}
+
+/// Give back memory that was only needed briefly (startup, config parsing, the settings
+/// window and its comctl32/comdlg32 code). Windows pages it back in if it is touched
+/// again; the steady-state loop only touches a few pages.
+fn trim_working_set() {
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
 }
 
@@ -347,14 +382,23 @@ impl App {
     }
 
     fn on_redraw_request(&mut self) {
-        if self.timer_armed {
-            return; // a frame is already scheduled; it will read the latest state
+        // New/louder sounds: full refresh rate. Pure fade-outs: FADE_HZ.
+        let rising = self.shared.rising.load(Acquire);
+        let interval = if rising {
+            self.frame_interval
+        } else {
+            self.frame_interval
+                .max(Duration::from_secs_f64(1.0 / FADE_HZ as f64))
+        };
+        if self.timer_armed && (self.timer_fast || !rising) {
+            return; // a frame is already scheduled soon enough; it reads the latest state
         }
         let since = self.last_frame.elapsed();
-        if since >= self.frame_interval {
+        if since >= interval {
             self.draw_frame();
         } else {
-            let wait = self.frame_interval - since;
+            self.timer_fast = rising;
+            let wait = interval - since;
             // Negative = relative time, in 100 ns units.
             let due = -((wait.as_nanos() / 100).max(1) as i64);
             unsafe {
@@ -368,11 +412,23 @@ impl App {
     }
 
     fn draw_frame(&mut self) {
-        // Clear the flag *before* reading so an update racing with us posts a new message.
+        // Clear the flags *before* reading so an update racing with us posts a new message.
         self.shared.redraw_pending.store(false, Release);
+        self.shared.rising.store(false, Release);
         let bins = self.current_bins();
         if self.overlay.is_visible() {
-            self.overlay.render(&bins);
+            let content = self.overlay.render(&bins);
+            // Nothing to draw any more: take the windows off the screen after a short
+            // linger (avoids flapping between footsteps). Next sound brings them back.
+            unsafe {
+                if content && self.idle_hide_armed {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_IDLE_HIDE);
+                    self.idle_hide_armed = false;
+                } else if !content && !self.idle_hide_armed {
+                    SetTimer(Some(self.hwnd), TIMER_IDLE_HIDE, IDLE_HIDE_MS, None);
+                    self.idle_hide_armed = true;
+                }
+            }
         }
         self.last_frame = Instant::now();
     }
@@ -546,6 +602,7 @@ impl App {
             Ok(win) => {
                 win.set_visible_checkbox(self.overlay.is_visible());
                 SETTINGS_HWND.store(win.hwnd.0 as isize, Relaxed);
+                self.shared.meters_wanted.store(true, Relaxed);
                 self.settings = Some(win);
                 // Show what the current style looks like.
                 self.start_preview();
@@ -563,13 +620,21 @@ impl App {
 
     fn close_settings(&mut self) {
         if let Some(s) = self.settings.take() {
-            SETTINGS_HWND.store(0, Relaxed);
             s.destroy();
         }
+        self.settings_closed();
+    }
+
+    /// Common cleanup when the settings window goes away (button or title-bar X).
+    fn settings_closed(&mut self) {
+        self.settings = None;
+        SETTINGS_HWND.store(0, Relaxed);
+        self.shared.meters_wanted.store(false, Relaxed);
         if self.save_pending {
             self.save_now();
         }
         self.update_wanted();
+        trim_working_set();
     }
 
     fn edit_config(&mut self) {
@@ -722,14 +787,14 @@ unsafe extern "system" fn controller_wndproc(
             }
             WM_APP_SETTINGS_CLOSED => {
                 // Closed with the title-bar X (the window is already destroyed).
+                with_app(|a| a.settings_closed());
+                return LRESULT(0);
+            }
+            WM_TIMER if wp.0 == TIMER_IDLE_HIDE => {
+                let _ = KillTimer(Some(hwnd), TIMER_IDLE_HIDE);
                 with_app(|a| {
-                    if a.settings.take().is_some() {
-                        SETTINGS_HWND.store(0, Relaxed);
-                    }
-                    if a.save_pending {
-                        a.save_now();
-                    }
-                    a.update_wanted();
+                    a.idle_hide_armed = false;
+                    a.overlay.hide_idle();
                 });
                 return LRESULT(0);
             }

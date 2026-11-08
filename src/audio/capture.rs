@@ -36,10 +36,15 @@ pub const WM_APP_REDRAW: u32 = WM_APP + 1;
 /// Posted when the stream (re)started or stopped, so the UI can refresh format info.
 pub const WM_APP_STREAM: u32 = WM_APP + 2;
 
-/// 20 ms shared-mode buffer: room for scheduling jitter; the engine still signals every period.
-const BUFFER_HNS: i64 = 200_000;
+/// 100 ms shared-mode buffer: plenty of room for scheduling jitter and for the 20 ms
+/// power-saving interval. The engine still signals the event every 10 ms period.
+const BUFFER_HNS: i64 = 1_000_000;
+/// Power-saving mode: while audio flows, drain every this many ms (paced by a
+/// high-resolution waitable timer) instead of on every 10 ms engine event.
+const POWER_SAVE_MS: i32 = 20;
 /// While bars fade with no packets, wake this often to advance the fade.
-const FADE_TICK_MS: u32 = 16;
+/// (Fades are drawn at 30 Hz, so ticking faster would only cost wakeups.)
+const FADE_TICK_MS: u32 = 33;
 
 /// Handle owned by the UI thread.
 pub struct CaptureThread {
@@ -242,20 +247,25 @@ impl Stream {
         }
     }
 
-    /// Drain every pending packet into the analyser. Allocation free.
+    /// Drain every pending packet into the analyser; returns the number of frames.
+    /// Allocation free.
     #[inline]
-    fn drain(&mut self, analyzer: &mut Analyzer) -> Result<()> {
+    fn drain(&mut self, analyzer: &mut Analyzer) -> Result<usize> {
+        let mut total = 0usize;
         let ch = self.format.channels;
         unsafe {
             loop {
-                if self.capture.GetNextPacketSize()? == 0 {
-                    return Ok(());
-                }
+                // One call per packet: when nothing is left, GetBuffer returns the success
+                // code AUDCLNT_S_BUFFER_EMPTY with 0 frames (and must not be released).
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let mut frames = 0u32;
                 let mut flags = 0u32;
                 self.capture
                     .GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                if frames == 0 {
+                    return Ok(total);
+                }
+                total += frames as usize;
                 let n = frames as usize * ch;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
                     analyzer.process_silence(frames as usize);
@@ -366,6 +376,17 @@ fn run(shared: &Arc<Shared>, config: &Arc<Mutex<Config>>, control: HANDLE) -> Re
     unsafe { enumerator.RegisterEndpointNotificationCallback(&notifier)? };
 
     let audio_event = unsafe { CreateEventW(None, false, false, None)? };
+    // Paces wakeups in power-saving mode. High resolution, so it does not raise the
+    // system-wide timer resolution.
+    let pacer = unsafe {
+        CreateWaitableTimerExW(
+            None,
+            PCWSTR::null(),
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ALL_ACCESS.0,
+        )
+        .or_else(|_| CreateWaitableTimerExW(None, PCWSTR::null(), 0, TIMER_ALL_ACCESS.0))?
+    };
 
     loop {
         if shared.quit.load(SeqCst) {
@@ -410,8 +431,7 @@ fn run(shared: &Arc<Shared>, config: &Arc<Mutex<Config>>, control: HANDLE) -> Re
                     &mut stream,
                     &mut analyzer,
                     params_version,
-                    audio_event,
-                    control,
+                    [audio_event, pacer, control],
                 )
             }
             Err(_) => Exit::DeviceLost,
@@ -433,6 +453,7 @@ fn run(shared: &Arc<Shared>, config: &Arc<Mutex<Config>>, control: HANDLE) -> Re
     unsafe {
         let _ = enumerator.UnregisterEndpointNotificationCallback(&notifier);
         let _ = CloseHandle(audio_event);
+        let _ = CloseHandle(pacer);
     }
     Ok(())
 }
@@ -444,13 +465,26 @@ fn pump(
     stream: &mut Stream,
     analyzer: &mut Analyzer,
     mut params_version: u32,
-    audio_event: HANDLE,
-    control: HANDLE,
+    [audio_event, pacer, control]: [HANDLE; 3],
 ) -> Exit {
-    let handles = [audio_event, control];
     let mut qbins = [0u8; BINS];
     let mut qmeters = [0u8; MAX_CHANNELS];
     let mut last = Instant::now();
+    let mut power_saving = config
+        .lock()
+        .map(|c| c.general.power_saving)
+        .unwrap_or(false);
+    // Power saving: the audio event only wakes us from silence; while audio flows the
+    // periodic pacer timer drives draining (half the wakeups of the 10 ms event).
+    let mut pacing = false;
+    let stop_pacing = |pacing: &mut bool| {
+        if *pacing {
+            unsafe {
+                let _ = CancelWaitableTimer(pacer);
+            }
+            *pacing = false;
+        }
+    };
 
     loop {
         // Detection settings changed in the Settings window: rebuild the analyser in place
@@ -462,22 +496,57 @@ fn pump(
                 let f = stream.format;
                 let layout = Layout::from_mask(f.channels, f.channel_mask, &cfg.speakers);
                 *analyzer = Analyzer::new(layout, f.sample_rate, &cfg);
+                power_saving = cfg.general.power_saving;
+            }
+            if !power_saving {
+                stop_pacing(&mut pacing);
             }
         }
-        let timeout = if analyzer.is_idle() {
+        // Full-band speaker-test meters cost a little per sample: only while Settings is open.
+        analyzer.set_meters(shared.meters_wanted.load(Relaxed));
+        let timeout = if pacing || analyzer.is_idle() {
             u32::MAX
         } else {
             FADE_TICK_MS
         };
+        let handles = [if pacing { pacer } else { audio_event }, control];
         let r = unsafe { WaitForMultipleObjects(&handles, false, timeout) };
 
         if r == WAIT_OBJECT_0 {
-            if stream.drain(analyzer).is_err() {
+            let frames = match stream.drain(analyzer) {
+                Ok(n) => n,
                 // Typically AUDCLNT_E_DEVICE_INVALIDATED (unplugged / format changed).
-                return Exit::DeviceLost;
+                Err(_) => {
+                    stop_pacing(&mut pacing);
+                    return Exit::DeviceLost;
+                }
+            };
+            let now = Instant::now();
+            if frames > 0 {
+                last = now;
+                if power_saving && !pacing {
+                    // Audio started flowing: switch to timer-paced draining.
+                    let due = -(POWER_SAVE_MS as i64 * 10_000);
+                    pacing =
+                        unsafe { SetWaitableTimer(pacer, &due, POWER_SAVE_MS, None, None, false) }
+                            .is_ok();
+                }
+            } else if pacing {
+                // Audio stopped: fade by wall-clock time; once nothing is left to fade,
+                // go back to sleeping on the audio event (zero wakeups while silent).
+                analyzer.tick(now.duration_since(last).as_secs_f32());
+                last = now;
+                if analyzer.is_idle() {
+                    stop_pacing(&mut pacing);
+                }
             }
-            last = Instant::now();
         } else if r.0 == WAIT_OBJECT_0.0 + 1 {
+            if shared.quit.load(SeqCst)
+                || shared.reinit_requested.load(SeqCst)
+                || !shared.wanted.load(SeqCst)
+            {
+                stop_pacing(&mut pacing);
+            }
             if shared.quit.load(SeqCst) {
                 return Exit::Quit;
             }
@@ -503,8 +572,14 @@ fn pump(
         shared.own_shot.store(analyzer.own_shot_active(), Relaxed);
         analyzer.quantized_bins(&mut qbins);
         analyzer.quantized_meters(&mut qmeters);
-        if shared.publish(&qbins, &qmeters) && !shared.redraw_pending.swap(true, AcqRel) {
-            notify(shared, WM_APP_REDRAW);
+        let (changed, rising) = shared.publish(&qbins, &qmeters);
+        if changed {
+            // A new/louder sound must not wait behind a slower fade frame: post again
+            // the first time `rising` is raised even if a redraw is already queued.
+            let first_rise = rising && !shared.rising.swap(true, AcqRel);
+            if !shared.redraw_pending.swap(true, AcqRel) || first_rise {
+                notify(shared, WM_APP_REDRAW);
+            }
         }
     }
 }

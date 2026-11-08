@@ -15,12 +15,16 @@
 //! * Small windows instead of one full-screen window: a full-screen 32-bit surface is
 //!   8 MB at 1080p and 33 MB at 4K, and DWM would have to blend a full-screen layer.
 //!   Edge strips are ~250 KB in total, the circle window ~70 KB.
-//! * `UpdateLayeredWindow` is called only for windows whose pixels changed.
+//! * Only the changed rectangle is pushed (`UpdateLayeredWindowIndirect` with a dirty
+//!   rect): a 240 px bar on a 2560 px strip uploads ~10x less than the whole strip.
+//! * The windows are hidden while there is nothing to draw (after a short linger), so
+//!   when it is quiet no overlay window covers the game at all and Windows can use
+//!   its fastest presentation path (independent flip) for the game.
 
 use super::util::{wide, LAYERED_STRIP_CLASS};
 use crate::config::{Config, OverlayStyle};
 use crate::dsp::analyzer::BINS;
-use crate::render::{paint_circle, paint_frame, CircleLayout, EdgeLayout, Style};
+use crate::render::{paint_circle, paint_frame, Bounds, CircleLayout, EdgeLayout, Style};
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -98,7 +102,7 @@ impl Surface {
                 pos: POINT { x, y },
                 size: SIZE { cx: w, cy: h },
             };
-            s.push();
+            s.push(None);
             Ok(s)
         }
     }
@@ -109,7 +113,8 @@ impl Surface {
         unsafe { std::slice::from_raw_parts_mut(self.bits, self.len) }
     }
 
-    fn push(&self) {
+    /// Push pixels to DWM: only `dirty` if given, else the whole surface.
+    fn push(&self, dirty: Option<Bounds>) {
         let src = POINT { x: 0, y: 0 };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
@@ -117,18 +122,26 @@ impl Surface {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
+        let rect = dirty.map(|b| RECT {
+            left: b.x0,
+            top: b.y0,
+            right: b.x1,
+            bottom: b.y1,
+        });
+        let info = UPDATELAYEREDWINDOWINFO {
+            cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+            hdcDst: HDC::default(),
+            pptDst: &self.pos,
+            psize: &self.size,
+            hdcSrc: self.memdc,
+            pptSrc: &src,
+            crKey: COLORREF(0),
+            pblend: &blend,
+            dwFlags: ULW_ALPHA,
+            prcDirty: rect.as_ref().map_or(std::ptr::null(), |r| r as *const RECT),
+        };
         unsafe {
-            let _ = UpdateLayeredWindow(
-                self.hwnd,
-                None,
-                Some(&self.pos),
-                Some(&self.size),
-                Some(self.memdc),
-                Some(&src),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
+            let _ = UpdateLayeredWindowIndirect(self.hwnd, &info);
         }
     }
 
@@ -165,22 +178,28 @@ impl Drop for Surface {
     }
 }
 
+// One instance per app: the size difference between variants doesn't matter.
+#[allow(clippy::large_enum_variant)]
 enum Kind {
     Edges {
         layout: EdgeLayout,
         strips: [Surface; 4],
-        has_content: [bool; 4],
+        painted: [Option<Bounds>; 4],
     },
     Circle {
         layout: CircleLayout,
         window: Surface,
+        content: bool,
     },
 }
 
 pub struct Overlay {
     kind: Kind,
     style: Style,
+    /// The user wants the overlay (hotkey / checkbox).
     visible: bool,
+    /// The windows are actually on screen (only while there is something to draw).
+    shown: bool,
 }
 
 unsafe extern "system" fn strip_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -216,7 +235,11 @@ impl Overlay {
             let layout = CircleLayout::new(cfg.overlay.circle_radius as i32, thickness);
             let s = layout.size;
             let window = Surface::new(hinst, (w - s) / 2, (h - s) / 2, s, s)?;
-            Kind::Circle { layout, window }
+            Kind::Circle {
+                layout,
+                window,
+                content: false,
+            }
         } else {
             let layout = EdgeLayout::new(w, h, thickness);
             let mk = |e: usize| {
@@ -227,13 +250,14 @@ impl Overlay {
             Kind::Edges {
                 layout,
                 strips,
-                has_content: [false; 4],
+                painted: [None; 4],
             }
         };
         let mut ov = Overlay {
             kind,
             style: Style::from_config(cfg),
             visible: false,
+            shown: false,
         };
         ov.render(&[0; BINS]); // circle: draws the guide ring
         Ok(ov)
@@ -258,8 +282,17 @@ impl Overlay {
         self.render(bins);
     }
 
+    /// The user wants the overlay on screen.
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// Something is drawn right now (or the circle's always-on guide ring).
+    pub fn has_content(&self) -> bool {
+        match &self.kind {
+            Kind::Edges { painted, .. } => painted.iter().any(|p| p.is_some()),
+            Kind::Circle { content, .. } => *content,
+        }
     }
 
     fn surfaces(&self) -> &[Surface] {
@@ -269,42 +302,80 @@ impl Overlay {
         }
     }
 
-    pub fn show(&mut self) {
-        for s in self.surfaces() {
-            s.show();
+    fn set_shown(&mut self, on: bool) {
+        if self.shown == on {
+            return;
         }
+        for s in self.surfaces() {
+            if on {
+                // Windows may have dropped a hidden layered window's pixels: push the
+                // whole surface once, so later dirty-rect updates start from correct pixels.
+                s.push(None);
+                s.show();
+            } else {
+                s.hide();
+            }
+        }
+        self.shown = on;
+    }
+
+    pub fn show(&mut self) {
         self.visible = true;
+        let content = self.has_content();
+        self.set_shown(content);
     }
 
     pub fn hide(&mut self) {
-        for s in self.surfaces() {
-            s.hide();
-        }
         self.visible = false;
+        self.set_shown(false);
     }
 
-    /// Repaint from quantised bins; only changed windows are pushed to DWM.
-    pub fn render(&mut self, bins: &[u8; BINS]) {
+    /// Called after the overlay has had no content for a while: take the windows off
+    /// the screen so nothing covers the game. They come back with the next sound.
+    pub fn hide_idle(&mut self) {
+        if !self.has_content() {
+            self.set_shown(false);
+        }
+    }
+
+    /// Repaint from quantised bins; only changed regions are pushed to DWM.
+    /// Returns whether anything is drawn now.
+    pub fn render(&mut self, bins: &[u8; BINS]) -> bool {
         match &mut self.kind {
             Kind::Edges {
                 layout,
                 strips,
-                has_content,
+                painted,
             } => {
                 let [a, b, c, d] = strips;
                 let mut bufs: [&mut [u32]; 4] = [a.pixels(), b.pixels(), c.pixels(), d.pixels()];
-                let changed = paint_frame(layout, &self.style, bins, &mut bufs, has_content);
-                for (s, c) in strips.iter().zip(changed) {
-                    if c {
-                        s.push();
+                let dirty = paint_frame(layout, &self.style, bins, &mut bufs, painted);
+                for (s, d) in strips.iter().zip(dirty) {
+                    if d.is_some() {
+                        s.push(d);
                     }
                 }
             }
-            Kind::Circle { layout, window } => {
-                if paint_circle(layout, &self.style, bins, window.pixels()) {
-                    window.push();
+            Kind::Circle {
+                layout,
+                window,
+                content,
+            } => {
+                if let Some(d) = paint_circle(layout, &self.style, bins, window.pixels()) {
+                    window.push(Some(d));
                 }
+                *content = bins
+                    .iter()
+                    .any(|&q| q as f32 / 255.0 >= self.style.min_intensity)
+                    || self.style.guide_opacity > 0.0;
             }
         }
+        let content = self.has_content();
+        // Content appeared: put the windows (back) on screen. Pixels are pushed first,
+        // so nothing stale flashes. Hiding again is delayed by the app (see hide_idle).
+        if self.visible && content {
+            self.set_shown(true);
+        }
+        content
     }
 }

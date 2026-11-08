@@ -49,13 +49,14 @@ const ID_AUTOSTEREO: i32 = 124;
 const ID_HOTKEY: i32 = 130;
 const ID_HOTKEY_NOTE: i32 = 131;
 pub const ID_STARTUP: i32 = 132;
+const ID_POWERSAVE: i32 = 133;
 pub const ID_DEFAULTS: i32 = 140;
 pub const ID_OPENCFG: i32 = 141;
 pub const ID_CLOSE: i32 = 142;
 
 // Layout, in 96-DPI units (scaled at creation).
 const CLIENT_W: i32 = 840;
-const CLIENT_H: i32 = 648;
+const CLIENT_H: i32 = 676;
 const LABEL_X: i32 = 16;
 const CTRL_X: i32 = 150;
 const CTRL_W: i32 = 210;
@@ -444,6 +445,12 @@ impl SettingsWindow {
         );
         self.label(hinst, "", ID_HOTKEY_NOTE, CTRL_X + 158, 562, 270);
         self.checkbox(hinst, "Start with Windows", ID_STARTUP, 594);
+        self.checkbox(
+            hinst,
+            "Power saving (bars may appear up to 10 ms later)",
+            ID_POWERSAVE,
+            622,
+        );
 
         self.heading(hinst, "Speaker test", RIGHT_X, 14);
         let by = PANEL_TOP + PANEL_H + 16;
@@ -461,7 +468,7 @@ impl SettingsWindow {
             "Close",
             ID_CLOSE,
             RIGHT_X + RIGHT_W - 96,
-            by + 104,
+            by + 132,
             96,
         );
         let hint = "Changes apply immediately and are saved automatically.";
@@ -542,6 +549,7 @@ impl SettingsWindow {
         self.set_checked(ID_CENTER, h.enabled);
         self.set_checked(ID_AUTOSTEREO, d.auto_stereo);
         self.set_checked(ID_STARTUP, startup);
+        self.set_checked(ID_POWERSAVE, g.power_saving);
         if let Ok((mods, vk)) = hotkey::parse(&g.hotkey) {
             let mut f = 0u32;
             if mods & hotkey::MOD_SHIFT != 0 {
@@ -646,6 +654,10 @@ impl SettingsWindow {
             ID_OWN => {
                 d.subtract_common = self.checked(id);
                 e.detection = true;
+            }
+            ID_POWERSAVE => {
+                cfg.general.power_saving = self.checked(id);
+                e.detection = true; // the capture thread re-reads it with the analyser settings
             }
             ID_OWNGUN => {
                 d.ignore_own_gunshots = self.checked(id);

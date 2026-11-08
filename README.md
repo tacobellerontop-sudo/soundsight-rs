@@ -198,6 +198,7 @@ All keys are optional. Highlights:
 | `general.hotkey` | `"F10"` | e.g. `"Ctrl+Shift+S"`, `"Alt+F9"`, `"Win+F8"` |
 | `general.refresh_hz` | `60` | Redraw cap. Nothing redraws while nothing changes. |
 | `general.mmcss` | `false` | Register the capture thread with MMCSS "Games". |
+| `general.power_saving` | `false` | Read audio every 20 ms instead of 10 ms while it plays (half the wakeups). |
 | `overlay.style` | `"edges"` | `"edges"`, `"edges_front_back"` or `"circle"`. |
 | `overlay.circle_radius` / `circle_guide_opacity` | `70` / `0.15` | Circle size in pixels; faint guide ring (0 = off). |
 | `overlay.thickness` / `min_thickness_frac` | `12` / `0.4` | Bar thickness for the loudest sounds; quiet ones get 40% of it. |
@@ -321,8 +322,15 @@ the same zero-allocation, block-based design:
 - **Four edge strips instead of one full-screen window.** The task description asked
   for a window covering the primary monitor; I changed that on purpose. A full-screen
   32-bit surface is 8 MB at 1080p and 33 MB at 4K (which alone breaks the 20 MB
-  target), and DWM would blend a full-screen layer. 6 px strips total about 100 KB,
-  look identical, and each strip is pushed only when its pixels change.
+  target), and DWM would blend a full-screen layer. 12 px strips total about 250 KB
+  and look identical.
+- **Only the changed rectangle is pushed** (`UpdateLayeredWindowIndirect` with a dirty
+  rect), not the whole strip: a 240 px bar on a 2560 px strip uploads ~10× less.
+- **The windows leave the screen when there is nothing to show** (1.5 s after the last
+  bar fades) and come back with the next sound. While it is quiet, no overlay window
+  covers the game at all, so Windows can use its fastest presentation path
+  (independent flip) for a borderless game. (The circle style's faint guide ring
+  counts as content; turn the ring off to get this in circle mode too.)
 
 ### Threading and timing
 
@@ -332,19 +340,39 @@ the same zero-allocation, block-based design:
   the game's own threads. `general.mmcss = true` enables the "Games" task if you
   measure a benefit.
 - The capture thread never polls. It wakes on the WASAPI event (~100×/s while audio
-  plays). It also wakes on a 16 ms timeout, but **only** while bars are still fading
+  plays). It also wakes on a 33 ms timeout, but **only** while bars are still fading
   and no packets arrive (loopback streams go silent when nothing plays). Once
   everything has faded it waits with `INFINITE`.
+- **Power saving** (Settings, off by default): while audio flows, the thread drains
+  every 20 ms, paced by a high-resolution waitable timer, instead of on every 10 ms
+  event: half the wakeups, bars up to 10 ms later. The audio event still wakes it
+  from silence, so it costs nothing while the PC is quiet.
 - At most one redraw message is ever queued (`redraw_pending` flag). The UI thread
   enforces the refresh cap with a high-resolution waitable timer (`SetTimer` has
   about 15.6 ms granularity, which would turn a 60 Hz cap into about 32 Hz).
+- **New or louder sounds are drawn at the full refresh rate (60 Hz); pure fade-outs at
+  30 Hz.** Reaction time is unchanged, but fades (most of the drawing) cost half.
+  Bars that fade below the visible threshold are dropped at once, so invisible
+  changes never trigger a redraw and fades end sooner.
+- The **UI thread is marked EcoQoS** (`SetThreadInformation`, power throttling): on
+  hybrid CPUs (Intel 12th gen+) Windows prefers E-cores for it and leaves P-cores to
+  the game. The capture thread keeps normal QoS for timely wakeups.
+- After start-up and after closing Settings, the process **trims its working set**
+  (`SetProcessWorkingSetSize(-1, -1)`), giving back memory that was only needed briefly.
+- The full-band speaker-test meters are only computed while Settings is open.
 
 ### Release profile
 
 `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`.
-I also measured `opt-level = "s"`: 516 KB instead of 594 KB, with the same DSP speed
-(0.122% vs 0.121% of a core, within noise). I kept 3 as the default; switch to "s"
-if you care more about size.
+`opt-level = "s"` gives a ~100 KB smaller exe but makes the DSP **3.7× slower** (it stops
+the compiler from vectorising the per-frame filter loop), so 3 it is.
+
+### DSP inner loop
+
+All channels of a frame are filtered together: one coefficient set, per-channel filter
+state in fixed-size lane arrays (2 lanes for stereo, 6 for 5.1, 8 for 7.1) that the
+compiler keeps in SIMD registers for a whole run of frames. Other formats (integer
+samples, >8 channels) are repacked into 8 lanes in an 8 KB stack buffer, never the heap.
 
 ---
 
@@ -352,13 +380,23 @@ if you care more about size.
 
 ### Measured so far
 
-Measured in the Linux development container, since no Windows machine was available:
+Measured in the Linux development container (no Windows machine was available);
+"before" is the previous release, "after" is this one:
 
-| What | Result | How |
-|---|---|---|
-| DSP cost, 7.1 @ 48 kHz, band-pass on | **~0.12% of one core** | `cargo run --release --example bench_dsp` |
-| Heap allocations in the audio hot path | **0** | `tests/no_alloc.rs` (counting global allocator around `process`/`tick`/`publish`) |
-| Release binary (x86_64-pc-windows-gnu) | **~600 KB** | mingw cross build; CI prints the MSVC (static CRT) size |
+| What | Before | After | How |
+|---|---|---|---|
+| DSP, stereo @ 48 kHz | 0.025% of a core | **0.016%** | `cargo run --release --example bench_dsp` |
+| DSP, 5.1 @ 48 kHz | 0.07% | **0.021%** | ″ |
+| DSP, 7.1 @ 48 kHz | 0.10% | **0.022%** | ″ |
+| Redraws in a busy fight (60 s simulation) | 41 / s | **20 / s** | `cargo run --release --example bench_pipeline` |
+| Pixels pushed to DWM, same simulation | 5,000 KB/s | **288 KB/s** | ″ |
+| Overlay windows on screen while quiet | always | **never** (hidden 1.5 s after the last bar) | checked under Wine |
+| Heap allocations in the audio hot path | 0 | **0** | `tests/no_alloc.rs` (counting global allocator) |
+| Capture wakeups while audio plays | 100 / s | 100 / s, or **50 / s** with Power saving | design |
+
+The simulation feeds constant ambience, footsteps every 1.2 s and gun bursts, so the
+overlay is never idle in it; in real matches there are quiet stretches where the
+windows leave the screen entirely.
 
 **Not yet measured on Windows:** total process CPU (DSP + WASAPI + GDI + DWM
 interaction), RAM, and GPU. By design I expect well under 1% CPU and roughly

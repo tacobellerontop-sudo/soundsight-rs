@@ -156,20 +156,56 @@ impl Style {
     }
 }
 
+/// A rectangle inside one window, in that window's pixel coordinates (exclusive end).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bounds {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+impl Bounds {
+    pub fn union(self, o: Bounds) -> Bounds {
+        Bounds {
+            x0: self.x0.min(o.x0),
+            y0: self.y0.min(o.y0),
+            x1: self.x1.max(o.x1),
+            y1: self.y1.max(o.y1),
+        }
+    }
+
+    pub fn area(&self) -> usize {
+        ((self.x1 - self.x0).max(0) * (self.y1 - self.y0).max(0)) as usize
+    }
+}
+
+fn union_opt(a: Option<Bounds>, b: Option<Bounds>) -> Option<Bounds> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.union(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
 /// Paint one frame. `bufs[edge]` must have `layout.strip_len(edge)` pixels.
-/// `has_content` tracks which strips were non-empty last frame (cleared only if needed).
-/// Returns which strips changed and must be pushed with `UpdateLayeredWindow`.
+/// `painted` holds what each strip had drawn last frame; only that area is cleared.
+/// Returns, per strip, the region that changed (old bars + new bars) and must be pushed
+/// to DWM, or None if the strip is unchanged.
 pub fn paint_frame(
     layout: &EdgeLayout,
     style: &Style,
     bins: &[u8; BINS],
     bufs: &mut [&mut [u32]; 4],
-    has_content: &mut [bool; 4],
-) -> [bool; 4] {
-    let mut drawn = [false; 4];
+    painted: &mut [Option<Bounds>; 4],
+) -> [Option<Bounds>; 4] {
+    let mut drawn: [Option<Bounds>; 4] = [None; 4];
     for (e, buf) in bufs.iter_mut().enumerate() {
-        if has_content[e] {
-            buf.fill(0);
+        if let Some(b) = painted[e] {
+            let sw = layout.strip_rect(e).2;
+            for y in b.y0..b.y1 {
+                buf[(y * sw + b.x0) as usize..(y * sw + b.x1) as usize].fill(0);
+            }
         }
     }
 
@@ -212,12 +248,12 @@ pub fn paint_frame(
         }
     }
 
-    let mut changed = [false; 4];
+    let mut dirty: [Option<Bounds>; 4] = [None; 4];
     for e in 0..4 {
-        changed[e] = has_content[e] || drawn[e];
-        has_content[e] = drawn[e];
+        dirty[e] = union_opt(painted[e], drawn[e]);
+        painted[e] = drawn[e];
     }
-    changed
+    dirty
 }
 
 /// Paint perimeter interval [a, b) (may extend past either end; wraps around).
@@ -227,7 +263,7 @@ fn paint_interval(
     a: f32,
     b: f32,
     bar: (u32, i32),
-    drawn: &mut [bool; 4],
+    drawn: &mut [Option<Bounds>; 4],
 ) {
     let p = l.perimeter();
     let len = (b - a).min(p);
@@ -247,7 +283,7 @@ fn paint_segment(
     a: f32,
     b: f32,
     bar: (u32, i32),
-    drawn: &mut [bool; 4],
+    drawn: &mut [Option<Bounds>; 4],
 ) {
     let (px, th) = bar;
     let (w, h, t) = (l.w as f32, l.h as f32, l.t);
@@ -283,17 +319,26 @@ fn paint_segment(
             RIGHT => fill(buf, sw, sh, sw - th, sw, lo - t, hi - t, px),
             _ => fill(buf, sw, sh, 0, th, lo - t, hi - t, px),
         };
-        drawn[edge] |= painted;
+        drawn[edge] = union_opt(drawn[edge], painted);
     }
 }
 
-/// Fill [x0,x1) x [y0,y1) (clipped) keeping the more opaque pixel. Returns true if anything was painted.
+/// Fill [x0,x1) x [y0,y1) (clipped) keeping the more opaque pixel. Returns the painted area.
 #[allow(clippy::too_many_arguments)]
-fn fill(buf: &mut [u32], sw: i32, sh: i32, x0: i32, x1: i32, y0: i32, y1: i32, px: u32) -> bool {
+fn fill(
+    buf: &mut [u32],
+    sw: i32,
+    sh: i32,
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    px: u32,
+) -> Option<Bounds> {
     let (x0, x1) = (x0.clamp(0, sw), x1.clamp(0, sw));
     let (y0, y1) = (y0.clamp(0, sh), y1.clamp(0, sh));
     if x1 <= x0 || y1 <= y0 {
-        return false;
+        return None;
     }
     let a = px >> 24;
     for y in y0..y1 {
@@ -304,7 +349,7 @@ fn fill(buf: &mut [u32], sw: i32, sh: i32, x0: i32, x1: i32, y0: i32, y1: i32, p
             }
         }
     }
-    true
+    Some(Bounds { x0, y0, x1, y1 })
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +359,8 @@ fn fill(buf: &mut [u32], sw: i32, sh: i32, x0: i32, x1: i32, y0: i32, y1: i32, p
 #[derive(Clone, Copy, Debug)]
 struct RingPixel {
     idx: u32,
+    x: u16,
+    y: u16,
     /// Direction of this pixel, whole degrees clockwise from up (0..360).
     deg: u16,
     /// Distance outwards from the inner radius, in pixels.
@@ -348,6 +395,8 @@ impl CircleLayout {
                 let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
                 pixels.push(RingPixel {
                     idx: (y * size + x) as u32,
+                    x: x as u16,
+                    y: y as u16,
                     deg: (deg as u16) % 360,
                     r,
                 });
@@ -387,13 +436,13 @@ fn scale_px(px: u32, cov: f32) -> u32 {
     ch(24) | ch(16) | ch(8) | ch(0)
 }
 
-/// Paint the ring. Returns true if the window must be pushed.
+/// Paint the ring. Returns the region that changed (to push to DWM), if any.
 pub fn paint_circle(
     layout: &mut CircleLayout,
     style: &Style,
     bins: &[u8; BINS],
     buf: &mut [u32],
-) -> bool {
+) -> Option<Bounds> {
     // Per-degree arc colour and thickness (fixed-size, on the stack).
     let mut arc_px = [0u32; 360];
     let mut arc_th = [0f32; 360];
@@ -423,7 +472,7 @@ pub fn paint_circle(
     layout.has_arcs = any;
     layout.painted_once = true;
     if !changed {
-        return false;
+        return None;
     }
 
     let guide = if style.guide_opacity > 0.0 {
@@ -433,6 +482,7 @@ pub fn paint_circle(
     } else {
         0
     };
+    let mut dirty: Option<Bounds> = None;
     for p in &layout.pixels {
         // Coverage of [0, th) along the radius, with half-pixel soft edges.
         let cover = |th: f32| ((th - p.r + 0.5).clamp(0.0, 1.0)) * ((p.r + 0.5).clamp(0.0, 1.0));
@@ -448,9 +498,20 @@ pub fn paint_circle(
                 out = a;
             }
         }
-        buf[p.idx as usize] = out;
+        let slot = &mut buf[p.idx as usize];
+        if *slot != out {
+            *slot = out;
+            let (x, y) = (p.x as i32, p.y as i32);
+            let b = Bounds {
+                x0: x,
+                y0: y,
+                x1: x + 1,
+                y1: y + 1,
+            };
+            dirty = Some(dirty.map_or(b, |d: Bounds| d.union(b)));
+        }
     }
-    true
+    dirty
 }
 
 #[cfg(test)]
@@ -498,7 +559,7 @@ mod tests {
 
     fn render(bins: &[u8; BINS]) -> ([Vec<u32>; 4], [bool; 4]) {
         let mut v: [Vec<u32>; 4] = std::array::from_fn(|e| vec![0u32; L.strip_len(e)]);
-        let mut has = [false; 4];
+        let mut has: [Option<Bounds>; 4] = [None; 4];
         let changed = {
             let [a, b, c, d] = &mut v;
             let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
@@ -510,7 +571,7 @@ mod tests {
                 &mut has,
             )
         };
-        (v, changed)
+        (v, changed.map(|c| c.is_some()))
     }
 
     #[test]
@@ -541,33 +602,33 @@ mod tests {
         cfg.overlay.bar_length = 800;
         let style = Style::from_config(&cfg);
         let mut v: [Vec<u32>; 4] = std::array::from_fn(|e| vec![0u32; L.strip_len(e)]);
-        let mut has = [false; 4];
+        let mut has: [Option<Bounds>; 4] = [None; 4];
         let mut bins = [0u8; BINS];
         bins[(BINS as f32 * 60.6 / 360.0) as usize] = 255; // near the top-right corner
         let [a, b, c, d] = &mut v;
         let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
         let changed = paint_frame(&L, &style, &bins, &mut bufs, &mut has);
-        assert!(changed[TOP] && changed[RIGHT]);
+        assert!(changed[TOP].is_some() && changed[RIGHT].is_some());
     }
 
     #[test]
     fn clearing_reports_change_once() {
         let mut v: [Vec<u32>; 4] = std::array::from_fn(|e| vec![0u32; L.strip_len(e)]);
-        let mut has = [false; 4];
+        let mut has: [Option<Bounds>; 4] = [None; 4];
         let style = Style::from_config(&Config::default());
         let mut bins = [0u8; BINS];
         bins[9] = 200;
         let [a, b, c, d] = &mut v;
         let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
-        assert!(paint_frame(&L, &style, &bins, &mut bufs, &mut has)[RIGHT]);
+        assert!(paint_frame(&L, &style, &bins, &mut bufs, &mut has)[RIGHT].is_some());
         bins[9] = 0;
         assert!(
-            paint_frame(&L, &style, &bins, &mut bufs, &mut has)[RIGHT],
+            paint_frame(&L, &style, &bins, &mut bufs, &mut has)[RIGHT].is_some(),
             "must push the cleared strip"
         );
         assert_eq!(
             paint_frame(&L, &style, &bins, &mut bufs, &mut has),
-            [false; 4],
+            [None; 4],
             "idle: nothing to push"
         );
         assert!(bufs[RIGHT].iter().all(|&p| p == 0));
@@ -585,7 +646,7 @@ mod tests {
             t,
         };
         let mut v: [Vec<u32>; 4] = std::array::from_fn(|e| vec![0u32; lay.strip_len(e)]);
-        let mut has = [false; 4];
+        let mut has: [Option<Bounds>; 4] = [None; 4];
         let mut bins = [0u8; BINS];
         bins[0] = 30; // quiet sound straight ahead -> thin bar on the top strip
         let [a, b, c, d] = &mut v;
@@ -604,7 +665,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.overlay.style = style;
         let mut v: [Vec<u32>; 4] = std::array::from_fn(|e| vec![0u32; L.strip_len(e)]);
-        let mut has = [false; 4];
+        let mut has: [Option<Bounds>; 4] = [None; 4];
         {
             let [a, b, c, d] = &mut v;
             let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
@@ -655,7 +716,7 @@ mod tests {
         let mut buf = vec![0u32; lay.len()];
         let mut bins = [0u8; BINS];
         bins[9] = 255; // right
-        assert!(paint_circle(&mut lay, &style, &bins, &mut buf));
+        assert!(paint_circle(&mut lay, &style, &bins, &mut buf).is_some());
         let s = lay.size;
         let c = s / 2;
         let at = |x: i32, y: i32| buf[(y * s + x) as usize];
@@ -665,9 +726,9 @@ mod tests {
         assert_eq!(at(c, c), 0, "centre (crosshair) never painted");
         // Silence: one push to clear, then nothing.
         let zero = [0u8; BINS];
-        assert!(paint_circle(&mut lay, &style, &zero, &mut buf));
+        assert!(paint_circle(&mut lay, &style, &zero, &mut buf).is_some());
         assert!(buf.iter().all(|&p| p == 0));
-        assert!(!paint_circle(&mut lay, &style, &zero, &mut buf));
+        assert!(paint_circle(&mut lay, &style, &zero, &mut buf).is_none());
     }
 
     #[test]
@@ -677,11 +738,43 @@ mod tests {
         let mut buf = vec![0u32; lay.len()];
         let zero = [0u8; BINS];
         assert!(
-            paint_circle(&mut lay, &style, &zero, &mut buf),
+            paint_circle(&mut lay, &style, &zero, &mut buf).is_some(),
             "first frame draws the guide"
         );
         assert!(buf.iter().any(|&p| p != 0));
-        assert!(!paint_circle(&mut lay, &style, &zero, &mut buf));
+        assert!(paint_circle(&mut lay, &style, &zero, &mut buf).is_none());
+    }
+
+    #[test]
+    fn dirty_rect_is_small_and_old_bars_are_cleared() {
+        let style = Style::from_config(&Config::default());
+        let mut v: [Vec<u32>; 4] = std::array::from_fn(|e| vec![0u32; L.strip_len(e)]);
+        let mut painted: [Option<Bounds>; 4] = [None; 4];
+        let [a, b, c, d] = &mut v;
+        let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
+        let mut bins = [0u8; BINS];
+        bins[0] = 255; // front: top strip centre
+        let d1 = paint_frame(&L, &style, &bins, &mut bufs, &mut painted)[TOP].unwrap();
+        assert!(
+            d1.area() * 5 < L.strip_len(TOP),
+            "dirty area {} is a small part of the strip",
+            d1.area()
+        );
+        // Move the sound to front-right on the same strip.
+        bins[0] = 0;
+        bins[3] = 255;
+        let d2 = paint_frame(&L, &style, &bins, &mut bufs, &mut painted)[TOP].unwrap();
+        assert!(
+            d2.x0 <= d1.x0 && d2.x1 >= d1.x1,
+            "dirty covers the old bar so it is erased on screen"
+        );
+        // Every pixel outside the new bar is transparent again.
+        let now = painted[TOP].unwrap();
+        for (i, &p) in bufs[TOP].iter().enumerate() {
+            let (x, y) = (i as i32 % L.w, i as i32 / L.w);
+            let inside = x >= now.x0 && x < now.x1 && y >= now.y0 && y < now.y1;
+            assert!(inside || p == 0, "stale pixel at {x},{y}");
+        }
     }
 
     #[test]
