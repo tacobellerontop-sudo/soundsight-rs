@@ -15,6 +15,14 @@
 //!   7. optional heuristics (centre-heavy / unfocused -> suppress)
 //!   8. deposit into a circular histogram of `BINS` directions; bins decay exponentially
 //!
+//! Own-gunshot gate: your own gun is not placed in 3D. It plays mostly in the front
+//! speakers (or both stereo channels), roughly balanced left/right, and is the loudest
+//! regular sound. Gun samples have stereo width, so block by block it is slightly
+//! louder on one side, then the other, which would make bars flicker ("burrr"). A block
+//! that is near the recent loudness peak, front-heavy and balanced starts a short hold
+//! (renewed on every shot) during which only clearly directional, non-frontal sounds
+//! are shown.
+//!
 //! On surround devices it also notices when only FL/FR ever carry sound (a stereo
 //! game played through a 7.1 device) and then maps FL/FR to hard left/right.
 //!
@@ -97,6 +105,17 @@ pub struct Analyzer {
     stereo_ring_len: usize,
     stereo_vectors: [(f32, f32); MAX_CHANNELS],
 
+    /// Own-gunshot gate.
+    own_filter: bool,
+    fl: Option<usize>,
+    fr: Option<usize>,
+    center: Option<usize>,
+    loud_ref_db: f32,
+    loud_ref_floor_db: f32,
+    loud_decay_db: f32,
+    own_hold_blocks: u32,
+    own_hold_left: u32,
+
     /// Stereo-content-on-surround-device detection.
     auto_stereo: bool,
     stereo_content: bool,
@@ -117,6 +136,21 @@ pub struct Analyzer {
     /// Number of sources found in the last block.
     pub last_event_count: usize,
 }
+
+/// Own-gunshot gate: a block within this many dB of the recent loudness peak counts as "loud".
+const OWN_BELOW_PEAK_DB: f32 = 12.0;
+/// ... and at least this share of its energy must be in FL+FR+C ...
+const OWN_MIN_FRONTNESS: f32 = 0.6;
+/// ... and |FL-FR| / (FL+FR) must be at most this (roughly balanced left/right).
+const OWN_MAX_BALANCE: f32 = 0.5;
+/// The loudness peak tracker falls by this many dB per second ...
+const OWN_PEAK_DECAY_DB_PER_S: f32 = 0.5;
+/// ... but never below `max_db - this`.
+const OWN_PEAK_FLOOR_BELOW_MAX_DB: f32 = 12.0;
+/// While the gate holds, a sound is shown only if it carries this share of the block's
+/// energy and comes from outside +-this angle around straight ahead.
+const OWN_HOLD_MIN_SHARE: f32 = 0.5;
+const OWN_HOLD_MIN_ANGLE: f32 = 60.0;
 
 /// Time constant for the stereo-content detector's averages.
 const MODE_TAU_S: f32 = 2.0;
@@ -162,6 +196,9 @@ impl Analyzer {
             stereo_vectors[r] = (1.0, 0.0);
         }
         let (stereo_ring, stereo_ring_len) = build_ring(&stereo_vectors, n);
+        let center = layout.speakers[..n]
+            .iter()
+            .position(|&s| s == Speaker::FrontCenter);
         // Only meaningful when the layout has more than the front pair.
         let auto_stereo = d.auto_stereo && fl.is_some() && fr.is_some() && ring_len > 2;
         Analyzer {
@@ -191,6 +228,15 @@ impl Analyzer {
             stereo_ring,
             stereo_ring_len,
             stereo_vectors,
+            own_filter: d.ignore_own_gunshots,
+            fl,
+            fr,
+            center,
+            loud_ref_db: d.max_db,
+            loud_ref_floor_db: d.max_db - OWN_PEAK_FLOOR_BELOW_MAX_DB,
+            loud_decay_db: OWN_PEAK_DECAY_DB_PER_S * block_dt,
+            own_hold_blocks: (d.own_shot_hold_ms / 1000.0 / block_dt).ceil() as u32,
+            own_hold_left: 0,
             auto_stereo,
             stereo_content: false,
             front_avg: 0.0,
@@ -219,6 +265,11 @@ impl Analyzer {
     /// being mapped to hard left/right.
     pub fn stereo_content(&self) -> bool {
         self.stereo_content
+    }
+
+    /// True while the own-gunshot gate is holding (shown in the speaker test).
+    pub fn own_shot_active(&self) -> bool {
+        self.own_hold_left > 0
     }
 
     /// Feed interleaved frames. `data.len()` should be a multiple of the channel count;
@@ -314,6 +365,9 @@ impl Analyzer {
         self.last_event = None;
         self.last_event_count = 0;
 
+        self.own_hold_left = self.own_hold_left.saturating_sub(1);
+        self.loud_ref_db = (self.loud_ref_db - self.loud_decay_db).max(self.loud_ref_floor_db);
+
         let active = total > floor_total * self.snr_lin && total > f32::MIN_POSITIVE;
         if self.auto_stereo && active {
             self.update_stereo_detector(&energy);
@@ -321,6 +375,10 @@ impl Analyzer {
         if !active {
             return;
         }
+        if self.own_filter && self.is_own_shot(&eff) {
+            self.own_hold_left = self.own_hold_blocks.max(1);
+        }
+        let holding = self.own_hold_left > 0;
 
         let (vectors, ring, ring_len) = if self.stereo_content {
             (self.stereo_vectors, self.stereo_ring, self.stereo_ring_len)
@@ -340,6 +398,7 @@ impl Analyzer {
             0.0
         };
         let mut peak = 0.0f32;
+        let eff_total: f32 = ring.iter().map(|&c| eff[c]).sum();
         for &c in ring {
             resid[c] = (eff[c] - common).max(0.0);
             peak = peak.max(resid[c]);
@@ -389,6 +448,12 @@ impl Analyzer {
             if intensity <= 0.0 {
                 continue;
             }
+            if holding
+                && (dir.total < OWN_HOLD_MIN_SHARE * eff_total
+                    || dir.angle_deg.abs() <= OWN_HOLD_MIN_ANGLE)
+            {
+                continue; // probably your own gun (or its echo)
+            }
             if self.heur_enabled {
                 let center: f32 = (0..n)
                     .filter(|&k| self.layout.is_center[k])
@@ -404,6 +469,28 @@ impl Analyzer {
             self.last_event_count += 1;
             self.deposit(dir.angle_deg, intensity);
         }
+    }
+
+    /// Loud, front-heavy and balanced left/right: probably your own gun.
+    fn is_own_shot(&mut self, eff: &[f32; MAX_CHANNELS]) -> bool {
+        let (Some(l), Some(r)) = (self.fl, self.fr) else {
+            return false;
+        };
+        let total: f32 = (0..self.n)
+            .filter(|&c| self.layout.vectors[c] != (0.0, 0.0))
+            .map(|c| eff[c])
+            .sum();
+        if total <= f32::MIN_POSITIVE {
+            return false;
+        }
+        let level = energy_to_db(total);
+        self.loud_ref_db = self.loud_ref_db.max(level);
+        let pair = eff[l] + eff[r];
+        let front = pair + self.center.map_or(0.0, |c| eff[c]);
+        let balance = (eff[l] - eff[r]).abs() / pair.max(1e-12);
+        level >= self.loud_ref_db - OWN_BELOW_PEAK_DB
+            && front >= OWN_MIN_FRONTNESS * total
+            && balance <= OWN_MAX_BALANCE
     }
 
     /// Decide whether a surround device is carrying stereo-only content.
@@ -603,6 +690,7 @@ mod tests {
         assert!(a.last_event.is_none());
 
         cfg.heuristics.enabled = false;
+        cfg.detection.ignore_own_gunshots = false;
         let mut b = analyzer(8, 0x63F, &cfg);
         b.process(&tone(&amps, 50));
         assert!(b.last_event.is_some());
@@ -665,8 +753,8 @@ mod tests {
     fn stereo_centered_own_sound_plus_enemy_left() {
         let cfg = Config::default();
         let mut a = analyzer(2, 0x3, &cfg);
-        // Own sound 0.2 in both, enemy adds a bit on the left.
-        a.process(&tone(&[0.26, 0.2], 60));
+        // Own footsteps (quiet) in both, enemy adds a bit on the left.
+        a.process(&tone(&[0.026, 0.02], 60));
         let ev = a.last_event.expect("left excess is shown");
         assert!(normalize_deg(ev.dir.angle_deg + 90.0).abs() < 1.0);
     }
@@ -710,6 +798,96 @@ mod tests {
             a.process(&tone(&amps, 100));
         }
         assert!(!a.stereo_content());
+    }
+
+    /// Own gun: loud, front-heavy, with stereo width that flips sides block to block.
+    fn own_gun_burst(channels: usize, shots: usize) -> Vec<f32> {
+        let mut v = Vec::new();
+        for k in 0..shots * 6 {
+            // 6 blocks per shot: 3 loud blocks with alternating width, then a quieter tail.
+            let (big, small) = if k % 6 < 3 { (0.5, 0.38) } else { (0.08, 0.06) };
+            let (l, r) = if k % 2 == 0 {
+                (big, small)
+            } else {
+                (small, big)
+            };
+            let amps: Vec<f32> = match channels {
+                2 => vec![l, r],
+                // FL FR C LFE BL BR SL SR: front + a little diffuse echo in the rear/sides.
+                _ => vec![l, r, (l + r) / 2.0, 0.0, 0.03, 0.025, 0.035, 0.03],
+            };
+            v.extend(tone(&amps, 10));
+        }
+        v
+    }
+
+    #[test]
+    fn own_gunshots_do_not_flicker_bars_stereo() {
+        let mut cfg = Config::default();
+        let mut a = analyzer(2, 0x3, &cfg);
+        a.process(&own_gun_burst(2, 8));
+        assert!(
+            a.bins().iter().all(|&b| b < 0.05),
+            "own spray should not light bars: {:?}",
+            a.bins()
+        );
+
+        cfg.detection.ignore_own_gunshots = false;
+        let mut b = analyzer(2, 0x3, &cfg);
+        b.process(&own_gun_burst(2, 8));
+        assert!(
+            b.bins().iter().any(|&x| x > 0.3),
+            "without the gate the flicker shows"
+        );
+    }
+
+    #[test]
+    fn own_gunshots_do_not_flicker_bars_7_1() {
+        let cfg = Config::default();
+        let mut a = analyzer(8, 0x63F, &cfg);
+        a.process(&own_gun_burst(8, 8));
+        assert!(a.bins().iter().all(|&b| b < 0.05), "{:?}", a.bins());
+        assert!(a.own_shot_active());
+    }
+
+    #[test]
+    fn enemy_shot_from_the_side_is_not_mistaken_for_own() {
+        let cfg = Config::default();
+        let mut a = analyzer(8, 0x63F, &cfg);
+        // Loud gunshot from the left side (SL), nothing in front.
+        a.process(&tone(&[0.05, 0.0, 0.0, 0.0, 0.05, 0.0, 0.5, 0.0], 40));
+        let ev = a.last_event.expect("enemy shot shown");
+        assert!(ev.dir.angle_deg < -60.0, "{}", ev.dir.angle_deg);
+        assert!(!a.own_shot_active());
+    }
+
+    #[test]
+    fn enemy_from_the_side_still_shows_while_spraying() {
+        let cfg = Config::default();
+        let mut a = analyzer(8, 0x63F, &cfg);
+        a.process(&own_gun_burst(8, 3));
+        // Keep spraying, and an enemy fires from the right side at the same time.
+        let mut both = Vec::new();
+        for k in 0..12 {
+            let (l, r) = if k % 2 == 0 { (0.5, 0.38) } else { (0.38, 0.5) };
+            both.extend(tone(&[l, r, (l + r) / 2.0, 0.0, 0.0, 0.0, 0.0, 1.2], 10));
+        }
+        a.process(&both);
+        let (lo, hi, _) = angle_to_bins(90.0, BINS);
+        assert!(a.bins()[lo].max(a.bins()[hi]) > 0.3, "{:?}", a.bins());
+        let (flo, fhi, _) = angle_to_bins(0.0, BINS);
+        assert!(
+            a.bins()[flo].max(a.bins()[fhi]) < 0.05,
+            "own gun stays hidden"
+        );
+    }
+
+    #[test]
+    fn quiet_footsteps_ahead_are_not_treated_as_gunshots() {
+        let cfg = Config::default();
+        let mut a = analyzer(8, 0x63F, &cfg);
+        a.process(&tone(&[0.02, 0.02, 0.03, 0.0, 0.0, 0.0, 0.0, 0.0], 60));
+        assert!(!a.own_shot_active());
     }
 
     #[test]

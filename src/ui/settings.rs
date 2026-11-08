@@ -43,6 +43,7 @@ const ID_GUIDE: i32 = 114;
 const ID_SENS: i32 = 120;
 const ID_FADE: i32 = 121;
 const ID_OWN: i32 = 122;
+const ID_OWNGUN: i32 = 125;
 const ID_CENTER: i32 = 123;
 const ID_AUTOSTEREO: i32 = 124;
 const ID_HOTKEY: i32 = 130;
@@ -54,7 +55,7 @@ pub const ID_CLOSE: i32 = 142;
 
 // Layout, in 96-DPI units (scaled at creation).
 const CLIENT_W: i32 = 840;
-const CLIENT_H: i32 = 620;
+const CLIENT_H: i32 = 648;
 const LABEL_X: i32 = 16;
 const CTRL_X: i32 = 150;
 const CTRL_W: i32 = 210;
@@ -74,6 +75,8 @@ static SWATCH_BRUSH: AtomicIsize = AtomicIsize::new(0);
 static NOTE_STATE: AtomicU8 = AtomicU8::new(255);
 /// Window DPI scale in 1/96 units.
 static DPI: AtomicU32 = AtomicU32::new(96);
+/// Whether the own-gunshot filter is enabled (for the speaker-test indicator).
+static OWN_GUN_ON: AtomicBool = AtomicBool::new(true);
 
 struct Ctx {
     shared: Arc<Shared>,
@@ -409,22 +412,23 @@ impl SettingsWindow {
         self.heading(hinst, "Detection", LABEL_X, 328);
         self.slider(hinst, "Sensitivity", ID_SENS, 354, 0, 100);
         self.slider(hinst, "Fade time", ID_FADE, 384, 100, 1000);
-        self.checkbox(hinst, "Filter my own sounds (footsteps, gun)", ID_OWN, 414);
-        self.checkbox(hinst, "Also hide centre-heavy sounds", ID_CENTER, 442);
+        self.checkbox(hinst, "Filter my own sounds (footsteps)", ID_OWN, 414);
+        self.checkbox(hinst, "Ignore my own gunshots", ID_OWNGUN, 442);
+        self.checkbox(hinst, "Also hide centre-heavy sounds", ID_CENTER, 470);
         self.checkbox(
             hinst,
             "Detect stereo games on a 7.1 device (e.g. CS2)",
             ID_AUTOSTEREO,
-            470,
+            498,
         );
 
-        self.heading(hinst, "General", LABEL_X, 506);
+        self.heading(hinst, "General", LABEL_X, 534);
         self.label(
             hinst,
             "Show/hide hotkey",
             -1,
             LABEL_X,
-            534,
+            562,
             CTRL_X - LABEL_X,
         );
         self.child(
@@ -434,12 +438,12 @@ impl SettingsWindow {
             WS_TABSTOP.0 | WS_BORDER.0,
             ID_HOTKEY,
             CTRL_X,
-            532,
+            560,
             150,
             26,
         );
-        self.label(hinst, "", ID_HOTKEY_NOTE, CTRL_X + 158, 534, 270);
-        self.checkbox(hinst, "Start with Windows", ID_STARTUP, 566);
+        self.label(hinst, "", ID_HOTKEY_NOTE, CTRL_X + 158, 562, 270);
+        self.checkbox(hinst, "Start with Windows", ID_STARTUP, 594);
 
         self.heading(hinst, "Speaker test", RIGHT_X, 14);
         let by = PANEL_TOP + PANEL_H + 16;
@@ -457,7 +461,7 @@ impl SettingsWindow {
             "Close",
             ID_CLOSE,
             RIGHT_X + RIGHT_W - 96,
-            by + 76,
+            by + 104,
             96,
         );
         let hint = "Changes apply immediately and are saved automatically.";
@@ -533,6 +537,8 @@ impl SettingsWindow {
         self.set_slider(ID_SENS, sens_from_min_db(d.min_db));
         self.set_slider(ID_FADE, d.decay_ms.round() as i32);
         self.set_checked(ID_OWN, d.subtract_common);
+        self.set_checked(ID_OWNGUN, d.ignore_own_gunshots);
+        OWN_GUN_ON.store(d.ignore_own_gunshots, Relaxed);
         self.set_checked(ID_CENTER, h.enabled);
         self.set_checked(ID_AUTOSTEREO, d.auto_stereo);
         self.set_checked(ID_STARTUP, startup);
@@ -639,6 +645,11 @@ impl SettingsWindow {
             }
             ID_OWN => {
                 d.subtract_common = self.checked(id);
+                e.detection = true;
+            }
+            ID_OWNGUN => {
+                d.ignore_own_gunshots = self.checked(id);
+                OWN_GUN_ON.store(d.ignore_own_gunshots, Relaxed);
                 e.detection = true;
             }
             ID_AUTOSTEREO => {
@@ -894,9 +905,26 @@ unsafe fn paint(hwnd: HWND) {
                 },
             );
 
+            // Own-gunshot filter indicator: lights up while it is ignoring your shots.
+            let holding = sh.own_shot.load(Relaxed);
+            let (dot, msg) = if !OWN_GUN_ON.load(Relaxed) {
+                (bgr(90, 90, 100), "Own-gunshot filter: off")
+            } else if holding {
+                (bgr(255, 200, 0), "Own-gunshot filter: ignoring your shot")
+            } else {
+                (
+                    bgr(70, 160, 90),
+                    "Own-gunshot filter: ready (lights up when you fire)",
+                )
+            };
+            let d = sc(10);
+            let ty = pad + line * 2 + (line - d) / 2;
+            fill(dc, pad, ty, pad + d, ty + d, dot);
+            text(dc, pad + d + sc(8), pad + line * 2, msg);
+
             let mut meters = [0u8; MAX_CHANNELS];
             sh.read_meters(&mut meters);
-            let top = pad + line * 3;
+            let top = pad + line * 3 + sc(6);
             let (x0, x1) = (sc(48), pw - sc(78));
             let row = sc(METER_ROW);
             for c in 0..layout.analysed_channels() {

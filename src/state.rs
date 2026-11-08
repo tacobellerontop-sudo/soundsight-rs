@@ -19,6 +19,8 @@ pub struct Shared {
     pub capturing: AtomicBool,
     /// Surround device carrying stereo-only content (FL/FR mapped to hard left/right).
     pub stereo_content: AtomicBool,
+    /// The own-gunshot gate is currently holding.
+    pub own_shot: AtomicBool,
     /// Overlay visible or settings window open -> capture should run.
     pub wanted: AtomicBool,
     /// A redraw message is queued and not yet handled.
@@ -43,6 +45,7 @@ impl Shared {
             sample_rate: AtomicU32::new(0),
             capturing: AtomicBool::new(false),
             stereo_content: AtomicBool::new(false),
+            own_shot: AtomicBool::new(false),
             wanted: AtomicBool::new(true),
             redraw_pending: AtomicBool::new(false),
             notify_hwnd: AtomicIsize::new(0),

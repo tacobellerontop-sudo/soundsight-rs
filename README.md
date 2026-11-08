@@ -58,6 +58,10 @@ playing the sound, and it works the same with a YouTube video.
   blocks → adaptive noise floor → **own-sound removal** (subtract the level common to
   all channels) → group adjacent speakers into sources → energy-weighted vector sum per
   source → angle + loudness. Several simultaneous sounds show as separate bars.
+- **Ignores your own gunshots:** your own gun is loud, front-heavy and balanced
+  left/right (it isn't placed in 3D like enemy sounds). Such a sound starts a short
+  hold (150 ms, renewed on every shot) during which only clearly directional side/rear
+  sounds are shown, so spraying no longer makes the bars flicker.
 - **Stereo games on a 7.1 device** (e.g. CS2 through Voicemeeter) are detected
   automatically: FL/FR are then shown as hard left/right instead of front-left/right.
 - **Bars grow longer, thicker and more opaque** as sounds get louder (closer).
@@ -206,6 +210,7 @@ All keys are optional. Highlights:
 | `detection.subtract_common` | `true` | "Filter my own sounds": remove the level shared by all channels. |
 | `detection.cluster_min_frac` | `0.25` | A second simultaneous sound must have ≥25% of the strongest one's energy. |
 | `detection.auto_stereo` | `true` | Detect stereo-only content on a 5.1/7.1 device. |
+| `detection.ignore_own_gunshots` / `own_shot_hold_ms` | `true` / `150` | Own-gunshot filter and how long it holds after each shot. |
 | `heuristics.enabled` | `true` | Also suppress centre-heavy / directionless sounds. |
 | `speakers.*` | 30/90/150/110/90 | Speaker angles (front, side, back, 5.1 surround pair, stereo). |
 
@@ -403,6 +408,13 @@ deathmatch; (4) overlay hidden (capture is stopped, so this should be ~0).
 - **Loudness is not distance.** Intensity is band energy in dBFS. It moves with your
   in-game and Windows volume: if you change volume a lot, adjust
   `detection.min_db`/`max_db`.
+- **The own-gunshot filter is a heuristic.** It treats any sound that is near the
+  loudest level heard recently, mostly in the front speakers and roughly balanced
+  left/right as your own. So an enemy shooting from **directly in front** of you is
+  hidden too, and while you fire, only enemy sounds that clearly dominate from the side
+  or behind get through. The speaker test in Settings shows a light while the filter
+  is active, so you can check it reacts to your shots. Turn it off with the
+  *Ignore my own gunshots* checkbox.
 - **Own-sound removal is a heuristic.** It assumes your own sounds are roughly equal in
   all channels. An enemy exactly as loud in every channel would be removed too, and an
   own sound that is louder in front still leaves some residue. The centre-heavy

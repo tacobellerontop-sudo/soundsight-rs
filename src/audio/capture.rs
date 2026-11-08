@@ -500,6 +500,7 @@ fn pump(
         shared
             .stereo_content
             .store(analyzer.stereo_content(), Relaxed);
+        shared.own_shot.store(analyzer.own_shot_active(), Relaxed);
         analyzer.quantized_bins(&mut qbins);
         analyzer.quantized_meters(&mut qmeters);
         if shared.publish(&qbins, &qmeters) && !shared.redraw_pending.swap(true, AcqRel) {

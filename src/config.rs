@@ -150,6 +150,11 @@ pub struct Detection {
     /// On 5.1/7.1 devices, detect stereo-only content (e.g. CS2 through Voicemeeter)
     /// and map FL/FR to hard left/right.
     pub auto_stereo: bool,
+    /// Hide your own gunshots: loud, front-heavy, left/right-balanced sounds start a
+    /// short hold during which only clearly directional side/rear sounds are shown.
+    pub ignore_own_gunshots: bool,
+    /// How long (ms) that hold lasts after each own shot.
+    pub own_shot_hold_ms: f32,
 }
 
 impl Default for Detection {
@@ -168,6 +173,8 @@ impl Default for Detection {
             subtract_common: true,
             cluster_min_frac: 0.25,
             auto_stereo: true,
+            ignore_own_gunshots: true,
+            own_shot_hold_ms: 150.0,
         }
     }
 }
@@ -254,6 +261,7 @@ impl Config {
         d.floor_fall_s = d.floor_fall_s.max(0.01);
         d.decay_ms = d.decay_ms.clamp(10.0, 5000.0);
         d.cluster_min_frac = d.cluster_min_frac.clamp(0.0, 1.0);
+        d.own_shot_hold_ms = d.own_shot_hold_ms.clamp(0.0, 2000.0);
         let h = &mut self.heuristics;
         h.max_center_ratio = h.max_center_ratio.clamp(0.0, 1.0);
         h.min_focus = h.min_focus.clamp(0.0, 1.0);
@@ -336,6 +344,10 @@ subtract_common = {sc}
 cluster_min_frac = {cmf:?}
 # On a 5.1/7.1 device, detect stereo-only content and show FL/FR as hard left/right.
 auto_stereo = {ast}
+# Hide your own gunshots (loud, front-heavy, balanced left/right). After each own shot,
+# for own_shot_hold_ms only clearly directional side/rear sounds are shown.
+ignore_own_gunshots = {iog}
+own_shot_hold_ms = {osh:?}
 
 [heuristics]
 # Also hide centre-heavy / directionless sounds. Imperfect; disable if it hides enemies.
@@ -381,6 +393,8 @@ stereo = {sst:?}
             sc = d.subtract_common,
             cmf = d.cluster_min_frac,
             ast = d.auto_stereo,
+            iog = d.ignore_own_gunshots,
+            osh = d.own_shot_hold_ms,
             he = h.enabled,
             mcr = h.max_center_ratio,
             mf = h.min_focus,
