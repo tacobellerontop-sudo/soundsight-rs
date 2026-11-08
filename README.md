@@ -61,13 +61,15 @@ playing the sound, and it works the same with a YouTube video.
 - **Stereo games on a 7.1 device** (e.g. CS2 through Voicemeeter) are detected
   automatically: FL/FR are then shown as hard left/right instead of front-left/right.
 - **Bars grow longer, thicker and more opaque** as sounds get louder (closer).
-- **Overlay:** four thin edge strips on the primary monitor, click-through, never takes
-  focus, redrawn only on change, capped at 60 Hz by default.
-- **Tray icon:** Show overlay, Calibrate / speaker test, Edit config, Reload config, Quit.
-  Double-click the tray icon to toggle the overlay.
-- **Calibration window:** live per-channel level meters (it plays nothing) so you can
-  check the channel mapping with Windows' speaker test or a surround test video.
-- **Config:** `soundsight.toml` next to the exe, created with defaults on first run.
+- **Three overlay styles** (pick in Settings): *Screen edges*, *Screen edges +
+  front/behind bars*, and a *Circle around the crosshair*. All are click-through,
+  never take focus, redraw only on change, capped at 60 Hz by default.
+- **Settings window** (click the tray icon): style, colour, opacity, sizes, sensitivity,
+  fade time, own-sound filter, hotkey picker, start with Windows, and a live
+  per-channel **speaker test** meter. Changes apply instantly and save automatically.
+- **Tray menu:** Settings & speaker test, Show overlay, Reload config file, Quit.
+- **Config file:** `soundsight.toml` next to the exe (written by the Settings window;
+  editing it by hand is optional).
 
 ---
 
@@ -112,22 +114,34 @@ build on `windows-latest`, and uploads the exe as an artifact.
 
 ## Usage
 
-- **F10** (configurable) shows/hides the overlay. While hidden and with the calibration
-  window closed, audio capture is **stopped** and the process sleeps.
+- **Click the tray icon** to open **Settings**. Everything is there; you never need
+  to touch the config file. While you change a setting, a 2-second preview pattern
+  is shown so you can see the effect without any sound playing.
+- **F10** (configurable in Settings) shows/hides the overlay. While it is hidden and
+  Settings is closed, audio capture is **stopped** and the process sleeps.
 - Run the game in **borderless windowed / "Windowed Fullscreen"**. Any overlay window
   is invisible on top of an exclusive-fullscreen game.
 - Turn **off** in-game HRTF / "3D headphone" options and Windows Sonic / Dolby Atmos
   for Headphones if you want surround bars: those render surround to *binaural
   stereo* before Windows sees it, so only left/right is left to detect.
-- Edit the config from the tray (**Edit config** opens Notepad), save, then use
-  **Reload config**. Invalid configs keep the previous settings and show a tray
-  notification with the parse error.
+- Advanced: *Settings → Open config file* opens `soundsight.toml` in Notepad; after
+  saving, use **Reload config file** in the tray menu. Invalid files keep the previous
+  settings and show a notification with the error.
 
 ### Reading the radar
 
-- Top edge = in front, bottom edge = behind, left/right edges = left/right.
-  The bar sits where a line from the screen centre in the sound's direction meets the
-  screen edge (so diagonals land near the corners).
+| Style | How to read it |
+|---|---|
+| **Screen edges** | Top edge = in front, bottom edge = behind, left/right edges = left/right. The bar sits where a line from the screen centre in the sound's direction meets the edge, so diagonals land near the corners. |
+| **Screen edges + front/behind bars** | Each sound is split in two: a **side bar** on the left/right edge (higher = more in front, lower = more behind), and a **top bar (in front)** or **bottom bar (behind)** that sits further left/right the more the sound is to that side. A sound straight ahead gets only a top bar; one directly to your side gets only a side bar. |
+| **Circle around crosshair** | A small ring around the screen centre; an arc lights up pointing at the sound (top of the ring = in front). A faint guide ring shows where it is (can be turned off). |
+
+> **Front vs behind needs surround audio.** With a stereo output device (most
+> headsets), the game mixes "in front" and "behind" into the same two channels, so
+> no program can tell them apart from the audio levels: sounds can only go left or
+> right. Use a 5.1/7.1 device (see the Voicemeeter section). The Settings window
+> tells you which case you are in.
+
 - Longer, more opaque bars = louder. Loudness is only a rough proxy for distance:
   a loud gun far away and quiet footsteps nearby can look similar.
 - Bars fade out over about 250 ms (`decay_ms`). Several recent sounds can be visible at
@@ -156,11 +170,11 @@ Voicemeeter downmixes to your headset.
    **mode** button of bus **A1** (shows "normal" by default) and choose **"Mix Down A"**.
    Without this, a stereo headset only plays channels 1-2 (FL/FR) and you would lose
    centre and surround sound.
-8. Start SoundSight and open **Calibrate** from the tray. The header should say
+8. Start SoundSight and open **Settings** from the tray (the speaker test is on the right). The header should say
    `7.1 (8 ch, mask 0x63F)`. Run Windows' speaker test (step 3's *Test* button):
    each speaker should light only its own bar.
 9. In the game, check that a sound from behind lights the BL/BR bars in the
-   calibration window. If only FL/FR/C ever move, the game (or an in-game HRTF option)
+   speaker test. If only FL/FR/C ever move, the game (or an in-game HRTF option)
    is still outputting stereo.
 
 Voicemeeter adds a few milliseconds of audio latency. Some people prefer a real
@@ -171,15 +185,17 @@ makes the **default Windows output device** a 5.1/7.1 device works with SoundSig
 
 ## Configuration
 
-All keys are optional; see [`soundsight.default.toml`](soundsight.default.toml) for
-every key with comments (it's the file written on first run, and a unit test keeps it
-identical to the built-in defaults). Highlights:
+Normally you use the Settings window. The file `soundsight.toml` holds every key with
+comments (it is generated from the built-in defaults; a unit test checks it round-trips).
+All keys are optional. Highlights:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `general.hotkey` | `"F10"` | e.g. `"Ctrl+Shift+S"`, `"Alt+F9"`, `"Win+F8"` |
 | `general.refresh_hz` | `60` | Redraw cap. Nothing redraws while nothing changes. |
 | `general.mmcss` | `false` | Register the capture thread with MMCSS "Games". |
+| `overlay.style` | `"edges"` | `"edges"`, `"edges_front_back"` or `"circle"`. |
+| `overlay.circle_radius` / `circle_guide_opacity` | `70` / `0.15` | Circle size in pixels; faint guide ring (0 = off). |
 | `overlay.thickness` / `min_thickness_frac` | `12` / `0.4` | Bar thickness for the loudest sounds; quiet ones get 40% of it. |
 | `overlay.bar_length` | `240` | Pixels (physical) at full intensity. |
 | `overlay.opacity` / `color` | `0.9` / `"#FF3B30"` | |
@@ -210,7 +226,7 @@ identical to the built-in defaults). Highlights:
             ┌──────────────── UI thread ────────────▼──────────────────────┐
             │ MsgWaitForMultipleObjectsEx(queue, hi-res waitable timer)    │
             │   refresh cap ─► paint 4 strip DIBs ─► UpdateLayeredWindow   │
-            │   tray menu, RegisterHotKey, calibration window, config      │
+            │   tray menu, RegisterHotKey, settings window, config         │
             └──────────────────────────────────────────────────────────────┘
  IMMNotificationClient (system thread): default device changed / unplugged
    ─► set flag + signal control event (never calls audio APIs itself)
@@ -229,7 +245,8 @@ Modules:
 | `src/state.rs` | Lock-free capture → UI hand-off | any |
 | `src/audio/capture.rs` | WASAPI loopback, device changes, thread loop | Windows |
 | `src/ui/overlay.rs` | Edge strip windows, DIB sections, `UpdateLayeredWindow` | Windows |
-| `src/ui/tray.rs`, `calibrate.rs`, `app.rs` | Tray, meter window, wiring + message loop | Windows |
+| `src/ui/settings.rs` | Settings window (Win32 controls) + speaker meters | Windows |
+| `src/ui/tray.rs`, `app.rs` | Tray, wiring, live apply/autosave, message loop | Windows |
 
 Everything that does maths is platform independent and unit tested on any OS.
 
@@ -422,9 +439,8 @@ deathmatch; (4) overlay hidden (capture is stopped, so this should be ~0).
 6. **Shared-mode mix formats** are 32-bit float in practice; 16- and 32-bit integer
    formats are also handled. Packed 24-bit and 64-bit float are rejected (the shared
    audio engine doesn't use them).
-7. **Config hot-reload is manual** (tray → Reload config) rather than a file watcher, to
-   avoid an extra thread or polling.
+7. **Hand edits of the config file need "Reload config file"** (no file watcher, to
+   avoid an extra thread or polling). Changes made in Settings apply instantly.
 8. Not tested on real Windows hardware by me: the Windows code was compiled and linked
    for Windows (MSVC check and a mingw build) and the maths is unit tested, but the
-   first real run is yours or CI's. Please report what you see in the calibration
-   window.
+   first real run is yours or CI's. Please report what you see in the speaker test.

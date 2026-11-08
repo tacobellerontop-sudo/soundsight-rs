@@ -8,8 +8,14 @@
 //! angle (0 = up/front, clockwise) and take the point where it leaves the screen.
 //! Front = top edge, behind = bottom edge, left/right = side edges. The bar is
 //! centred there and runs *along the perimeter*, so long bars wrap around corners.
+//!
+//! "Edges + front/behind" splits each sound into its side component (left/right edge,
+//! higher up = more in front) and its front/back component (top bar = in front,
+//! bottom bar = behind, further left/right = more to that side).
+//!
+//! The circle style paints arcs on a small ring around the screen centre.
 
-use crate::config::Config;
+use crate::config::{Config, OverlayStyle};
 use crate::dsp::analyzer::BINS;
 use crate::dsp::direction::bin_center_deg;
 
@@ -101,7 +107,18 @@ pub struct Style {
     pub min_length_frac: f32,
     pub min_intensity: f32,
     pub min_thickness_frac: f32,
+    pub mode: OverlayStyle,
+    pub guide_opacity: f32,
 }
+
+/// Bars whose side or front/back component is below this (|sin| or |cos|) are not
+/// drawn in the front/behind style: a sound straight ahead gets no side bar, a sound
+/// exactly to the side gets no front/behind bar.
+const SPLIT_MIN_COMPONENT: f32 = 0.3;
+/// How far from the centre of an edge the split-style bars may move (fraction of half the edge).
+const SPLIT_SPREAD: f32 = 0.75;
+/// Circle style: arc span in degrees for the loudest sounds.
+pub const CIRCLE_MAX_ARC_DEG: f32 = 60.0;
 
 impl Style {
     pub fn from_config(c: &Config) -> Style {
@@ -114,6 +131,8 @@ impl Style {
             min_length_frac: o.min_length_frac,
             min_intensity: o.min_intensity,
             min_thickness_frac: o.min_thickness_frac,
+            mode: o.style,
+            guide_opacity: o.circle_guide_opacity,
         }
     }
 
@@ -154,15 +173,43 @@ pub fn paint_frame(
         }
     }
 
+    let (w, h) = (layout.w as f32, layout.h as f32);
+    let mut bar_at = |bufs: &mut [&mut [u32]; 4], center: f32, intensity: f32| {
+        if intensity < style.min_intensity {
+            return;
+        }
+        let half = style.length(intensity) / 2.0;
+        let bar = (style.pixel(intensity), style.thickness(intensity, layout.t));
+        paint_interval(layout, bufs, center - half, center + half, bar, &mut drawn);
+    };
+
     for (i, &q) in bins.iter().enumerate() {
         let intensity = q as f32 / 255.0;
         if q == 0 || intensity < style.min_intensity {
             continue;
         }
-        let center = layout.angle_to_perimeter(bin_center_deg(i, BINS));
-        let half = style.length(intensity) / 2.0;
-        let bar = (style.pixel(intensity), style.thickness(intensity, layout.t));
-        paint_interval(layout, bufs, center - half, center + half, bar, &mut drawn);
+        let deg = bin_center_deg(i, BINS);
+        if style.mode != OverlayStyle::EdgesFrontBack {
+            bar_at(bufs, layout.angle_to_perimeter(deg), intensity);
+            continue;
+        }
+        let (sn, cs) = deg.to_radians().sin_cos();
+        if sn.abs() >= SPLIT_MIN_COMPONENT {
+            // Side bar; higher on the edge = more in front.
+            let y = h / 2.0 - cs * (h / 2.0) * SPLIT_SPREAD;
+            let s = if sn > 0.0 {
+                w + y
+            } else {
+                2.0 * w + h + (h - y)
+            };
+            bar_at(bufs, s, intensity * sn.abs().sqrt());
+        }
+        if cs.abs() >= SPLIT_MIN_COMPONENT {
+            // Front (top) / behind (bottom) bar; further left/right = more to that side.
+            let x = w / 2.0 + sn * (w / 2.0) * SPLIT_SPREAD;
+            let s = if cs > 0.0 { x } else { w + h + (w - x) };
+            bar_at(bufs, s, intensity * cs.abs().sqrt());
+        }
     }
 
     let mut changed = [false; 4];
@@ -256,6 +303,152 @@ fn fill(buf: &mut [u32], sw: i32, sh: i32, x0: i32, x1: i32, y0: i32, y1: i32, p
                 *p = px;
             }
         }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Circle style
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+struct RingPixel {
+    idx: u32,
+    /// Direction of this pixel, whole degrees clockwise from up (0..360).
+    deg: u16,
+    /// Distance outwards from the inner radius, in pixels.
+    r: f32,
+}
+
+/// Precomputed geometry of the ring: which pixels of the square window lie on it,
+/// with their angle and radius, so painting needs no trigonometry per pixel.
+pub struct CircleLayout {
+    /// Side length of the square window.
+    pub size: i32,
+    pub t: i32,
+    pixels: Vec<RingPixel>,
+    has_arcs: bool,
+    painted_once: bool,
+}
+
+impl CircleLayout {
+    pub fn new(radius: i32, thickness: i32) -> CircleLayout {
+        let r0 = radius.max(4) as f32;
+        let t = thickness.max(1);
+        let size = 2 * (radius.max(4) + t + 2);
+        let c = size as f32 / 2.0;
+        let mut pixels = Vec::new();
+        for y in 0..size {
+            for x in 0..size {
+                let (dx, dy) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c);
+                let r = (dx * dx + dy * dy).sqrt() - r0;
+                if r < -1.0 || r > t as f32 + 1.0 {
+                    continue;
+                }
+                let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
+                pixels.push(RingPixel {
+                    idx: (y * size + x) as u32,
+                    deg: (deg as u16) % 360,
+                    r,
+                });
+            }
+        }
+        CircleLayout {
+            size,
+            t,
+            pixels,
+            has_arcs: false,
+            painted_once: false,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        (self.size * self.size) as usize
+    }
+
+    /// Force a full repaint on the next frame (e.g. colour changed).
+    pub fn invalidate(&mut self) {
+        self.painted_once = false;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+}
+
+/// Scale a premultiplied pixel by a coverage factor (anti-aliased edges).
+#[inline]
+fn scale_px(px: u32, cov: f32) -> u32 {
+    if cov >= 1.0 {
+        return px;
+    }
+    let k = (cov.max(0.0) * 256.0) as u32;
+    let ch = |shift: u32| ((((px >> shift) & 0xFF) * k) >> 8) << shift;
+    ch(24) | ch(16) | ch(8) | ch(0)
+}
+
+/// Paint the ring. Returns true if the window must be pushed.
+pub fn paint_circle(
+    layout: &mut CircleLayout,
+    style: &Style,
+    bins: &[u8; BINS],
+    buf: &mut [u32],
+) -> bool {
+    // Per-degree arc colour and thickness (fixed-size, on the stack).
+    let mut arc_px = [0u32; 360];
+    let mut arc_th = [0f32; 360];
+    let mut any = false;
+    for (i, &q) in bins.iter().enumerate() {
+        let intensity = q as f32 / 255.0;
+        if q == 0 || intensity < style.min_intensity {
+            continue;
+        }
+        any = true;
+        let center = bin_center_deg(i, BINS).rem_euclid(360.0).round() as i32;
+        let span = CIRCLE_MAX_ARC_DEG
+            * (style.min_length_frac + (1.0 - style.min_length_frac) * intensity);
+        let half = (span / 2.0).round() as i32;
+        let px = style.pixel(intensity);
+        let th = style.thickness(intensity, layout.t) as f32;
+        for d in -half..=half {
+            let k = (center + d).rem_euclid(360) as usize;
+            if (arc_px[k] >> 24) < (px >> 24) {
+                arc_px[k] = px;
+            }
+            arc_th[k] = arc_th[k].max(th);
+        }
+    }
+
+    let changed = any || layout.has_arcs || !layout.painted_once;
+    layout.has_arcs = any;
+    layout.painted_once = true;
+    if !changed {
+        return false;
+    }
+
+    let guide = if style.guide_opacity > 0.0 {
+        let a8 = (style.guide_opacity * 255.0 + 0.5) as u32;
+        let pm = |c: u8| (c as u32 * a8 + 127) / 255;
+        (a8 << 24) | (pm(style.rgb.0) << 16) | (pm(style.rgb.1) << 8) | pm(style.rgb.2)
+    } else {
+        0
+    };
+    for p in &layout.pixels {
+        // Coverage of [0, th) along the radius, with half-pixel soft edges.
+        let cover = |th: f32| ((th - p.r + 0.5).clamp(0.0, 1.0)) * ((p.r + 0.5).clamp(0.0, 1.0));
+        let mut out = if guide != 0 {
+            scale_px(guide, cover(1.5))
+        } else {
+            0
+        };
+        let k = p.deg as usize;
+        if arc_px[k] != 0 {
+            let a = scale_px(arc_px[k], cover(arc_th[k]));
+            if (a >> 24) > (out >> 24) {
+                out = a;
+            }
+        }
+        buf[p.idx as usize] = out;
     }
     true
 }
@@ -405,6 +598,90 @@ mod tests {
             0,
             "inner row not painted for a quiet sound"
         );
+    }
+
+    fn render_style(style: OverlayStyle, bins: &[u8; BINS]) -> [Vec<u32>; 4] {
+        let mut cfg = Config::default();
+        cfg.overlay.style = style;
+        let mut v: [Vec<u32>; 4] = std::array::from_fn(|e| vec![0u32; L.strip_len(e)]);
+        let mut has = [false; 4];
+        {
+            let [a, b, c, d] = &mut v;
+            let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
+            paint_frame(&L, &Style::from_config(&cfg), bins, &mut bufs, &mut has);
+        }
+        v
+    }
+
+    fn lit(buf: &[u32]) -> bool {
+        buf.iter().any(|&p| p != 0)
+    }
+
+    #[test]
+    fn front_back_style_behind_left_lights_left_and_bottom() {
+        let mut bins = [0u8; BINS];
+        bins[(BINS as f32 * (360.0 - 135.0) / 360.0) as usize] = 255; // -135 deg: behind-left
+        let v = render_style(OverlayStyle::EdgesFrontBack, &bins);
+        assert!(lit(&v[LEFT]) && lit(&v[BOTTOM]), "side + behind bars");
+        assert!(!lit(&v[TOP]) && !lit(&v[RIGHT]));
+        // The behind bar sits left of centre; the side bar sits below the middle.
+        let first = v[BOTTOM].iter().position(|&p| p != 0).unwrap() as i32 % L.w;
+        assert!(first < L.w / 2);
+        let r = L.strip_rect(LEFT);
+        let row = v[LEFT].iter().position(|&p| p != 0).unwrap() as i32 / r.2 + L.t;
+        assert!(row > L.h / 2, "behind = lower on the side edge");
+    }
+
+    #[test]
+    fn front_back_style_pure_side_and_pure_front() {
+        let mut side = [0u8; BINS];
+        side[9] = 255; // +90: right, neither in front nor behind
+        let v = render_style(OverlayStyle::EdgesFrontBack, &side);
+        assert!(lit(&v[RIGHT]) && !lit(&v[TOP]) && !lit(&v[BOTTOM]));
+
+        let mut front = [0u8; BINS];
+        front[0] = 255;
+        let v = render_style(OverlayStyle::EdgesFrontBack, &front);
+        assert!(lit(&v[TOP]) && !lit(&v[LEFT]) && !lit(&v[RIGHT]) && !lit(&v[BOTTOM]));
+    }
+
+    #[test]
+    fn circle_arc_points_at_sound() {
+        let mut cfg = Config::default();
+        cfg.overlay.style = OverlayStyle::Circle;
+        cfg.overlay.circle_guide_opacity = 0.0;
+        let style = Style::from_config(&cfg);
+        let mut lay = CircleLayout::new(70, 12);
+        let mut buf = vec![0u32; lay.len()];
+        let mut bins = [0u8; BINS];
+        bins[9] = 255; // right
+        assert!(paint_circle(&mut lay, &style, &bins, &mut buf));
+        let s = lay.size;
+        let c = s / 2;
+        let at = |x: i32, y: i32| buf[(y * s + x) as usize];
+        assert_ne!(at(c + 70 + 4, c), 0, "ring pixel to the right is lit");
+        assert_eq!(at(c - 70 - 4, c), 0, "left side dark");
+        assert_eq!(at(c, c - 70 - 4), 0, "top dark");
+        assert_eq!(at(c, c), 0, "centre (crosshair) never painted");
+        // Silence: one push to clear, then nothing.
+        let zero = [0u8; BINS];
+        assert!(paint_circle(&mut lay, &style, &zero, &mut buf));
+        assert!(buf.iter().all(|&p| p == 0));
+        assert!(!paint_circle(&mut lay, &style, &zero, &mut buf));
+    }
+
+    #[test]
+    fn circle_guide_ring_drawn_once() {
+        let style = Style::from_config(&Config::default());
+        let mut lay = CircleLayout::new(50, 8);
+        let mut buf = vec![0u32; lay.len()];
+        let zero = [0u8; BINS];
+        assert!(
+            paint_circle(&mut lay, &style, &zero, &mut buf),
+            "first frame draws the guide"
+        );
+        assert!(buf.iter().any(|&p| p != 0));
+        assert!(!paint_circle(&mut lay, &style, &zero, &mut buf));
     }
 
     #[test]

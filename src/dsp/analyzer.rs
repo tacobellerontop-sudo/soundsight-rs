@@ -109,7 +109,7 @@ pub struct Analyzer {
     decay_per_block: f32,
     bins: [f32; BINS],
 
-    /// Full-band mean square per channel with peak-hold style release, for the calibration meter.
+    /// Full-band mean square per channel with peak-hold style release, for the speaker-test meter.
     meters: [f32; MAX_CHANNELS],
 
     /// Strongest source found in the last block (for tests and debugging).

@@ -7,7 +7,52 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const LAYERED_STRIP_CLASS: &str = "SoundSightStrip";
 pub const CONTROLLER_CLASS: &str = "SoundSightController";
-pub const CALIBRATION_CLASS: &str = "SoundSightCalibration";
+pub const SETTINGS_CLASS: &str = "SoundSightSettings";
+
+const RUN_KEY: windows::core::PCWSTR =
+    windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_VALUE: windows::core::PCWSTR = windows::core::w!("SoundSight");
+
+/// Is "Start with Windows" on (an HKCU Run entry exists)?
+pub fn startup_enabled() -> bool {
+    use windows::Win32::System::Registry::*;
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            RUN_VALUE,
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            None,
+        )
+    }
+    .is_ok()
+}
+
+/// Add or remove the per-user Run entry pointing at this exe. No admin rights needed.
+pub fn set_startup(enabled: bool) -> bool {
+    use windows::Win32::System::Registry::*;
+    unsafe {
+        if !enabled {
+            let r = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+            return r.is_ok() || r == ERROR_FILE_NOT_FOUND;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let cmd = wide(&format!("\"{}\"", exe.display()));
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            RUN_VALUE,
+            REG_SZ.0,
+            Some(cmd.as_ptr() as *const core::ffi::c_void),
+            (cmd.len() * 2) as u32,
+        )
+        .is_ok()
+    }
+}
 
 /// NUL-terminated UTF-16.
 pub fn wide(s: &str) -> Vec<u16> {

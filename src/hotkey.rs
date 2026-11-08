@@ -32,6 +32,39 @@ pub fn parse(s: &str) -> Result<(u32, u32), String> {
         .ok_or_else(|| format!("hotkey '{s}' has no key"))
 }
 
+/// Inverse of `parse` (MOD_NOREPEAT is ignored). Returns None for keys `parse`
+/// does not understand, so anything written to the config can be read back.
+pub fn format(mods: u32, vk: u32) -> Option<String> {
+    let key = match vk {
+        0x30..=0x39 | 0x41..=0x5A => char::from(vk as u8).to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x70 + 1),
+        0x60..=0x69 => format!("Numpad{}", vk - 0x60),
+        0x2D => "Insert".into(),
+        0x2E => "Delete".into(),
+        0x24 => "Home".into(),
+        0x23 => "End".into(),
+        0x21 => "PageUp".into(),
+        0x22 => "PageDown".into(),
+        0x13 => "Pause".into(),
+        0x91 => "ScrollLock".into(),
+        0x20 => "Space".into(),
+        _ => return None,
+    };
+    let mut s = String::new();
+    for (bit, name) in [
+        (MOD_CONTROL, "Ctrl+"),
+        (MOD_ALT, "Alt+"),
+        (MOD_SHIFT, "Shift+"),
+        (MOD_WIN, "Win+"),
+    ] {
+        if mods & bit != 0 {
+            s.push_str(name);
+        }
+    }
+    s.push_str(&key);
+    Some(s)
+}
+
 fn key_code(k: &str) -> Option<u32> {
     let b = k.as_bytes();
     if b.len() == 1 && (b[0].is_ascii_uppercase() || b[0].is_ascii_digit()) {
@@ -74,6 +107,23 @@ mod tests {
         );
         assert_eq!(parse("Alt+Numpad5"), Ok((MOD_NOREPEAT | MOD_ALT, 0x65)));
         assert_eq!(parse("Win+F24"), Ok((MOD_NOREPEAT | MOD_WIN, 0x87)));
+    }
+
+    #[test]
+    fn format_round_trips() {
+        for text in [
+            "F10",
+            "Ctrl+Shift+S",
+            "Alt+Numpad5",
+            "Win+F24",
+            "Ctrl+Alt+Delete",
+            "Shift+Space",
+            "7",
+        ] {
+            let (m, vk) = parse(text).unwrap();
+            assert_eq!(format(m, vk).as_deref(), Some(text));
+        }
+        assert_eq!(format(0, 0xBA), None, "OEM keys are not supported");
     }
 
     #[test]

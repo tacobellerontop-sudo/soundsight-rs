@@ -397,13 +397,22 @@ fn run(shared: &Arc<Shared>, config: &Arc<Mutex<Config>>, control: HANDLE) -> Re
         shared.channels.store(f.channels as u32, SeqCst);
         shared.channel_mask.store(layout.mask, SeqCst);
         shared.sample_rate.store(f.sample_rate, SeqCst);
+        let params_version = shared.params_version.load(SeqCst);
         let mut analyzer = Analyzer::new(layout, f.sample_rate, &cfg);
 
         let exit = match stream.start() {
             Ok(()) => {
                 shared.capturing.store(true, SeqCst);
                 notify(shared, WM_APP_STREAM);
-                pump(shared, &mut stream, &mut analyzer, audio_event, control)
+                pump(
+                    shared,
+                    config,
+                    &mut stream,
+                    &mut analyzer,
+                    params_version,
+                    audio_event,
+                    control,
+                )
             }
             Err(_) => Exit::DeviceLost,
         };
@@ -431,8 +440,10 @@ fn run(shared: &Arc<Shared>, config: &Arc<Mutex<Config>>, control: HANDLE) -> Re
 /// The steady-state loop. No allocation, no polling.
 fn pump(
     shared: &Shared,
+    config: &Mutex<Config>,
     stream: &mut Stream,
     analyzer: &mut Analyzer,
+    mut params_version: u32,
     audio_event: HANDLE,
     control: HANDLE,
 ) -> Exit {
@@ -442,6 +453,17 @@ fn pump(
     let mut last = Instant::now();
 
     loop {
+        // Detection settings changed in the Settings window: rebuild the analyser in place
+        // (no device re-open, no gap). Only happens on a change, never in steady state.
+        let v = shared.params_version.load(Acquire);
+        if v != params_version {
+            params_version = v;
+            if let Ok(cfg) = config.lock() {
+                let f = stream.format;
+                let layout = Layout::from_mask(f.channels, f.channel_mask, &cfg.speakers);
+                *analyzer = Analyzer::new(layout, f.sample_rate, &cfg);
+            }
+        }
         let timeout = if analyzer.is_idle() {
             u32::MAX
         } else {

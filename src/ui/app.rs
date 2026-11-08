@@ -7,18 +7,24 @@
 //! Redraw flow: capture thread changes bins -> posts WM_APP_REDRAW (at most one
 //! outstanding) -> if a frame was drawn less than 1/refresh_hz ago, arm the timer for
 //! the remainder, else draw now. Bursts of updates therefore coalesce into one frame.
+//!
+//! Settings: the settings window reports control changes to `on_settings_control`;
+//! the new config applies immediately (overlay restyle/rebuild, analyser parameters,
+//! hotkey), a short preview pattern is shown, and the file is saved after a short delay.
 
-use super::calibrate::{self, WM_APP_CALIB_CLOSED};
 use super::overlay::{self, Overlay};
+use super::settings::{self, SettingsWindow, WM_APP_SETTINGS_CLOSED};
 use super::tray::{self, Tray, WM_APP_TRAY};
-use super::util::{make_icon, wide, CONTROLLER_CLASS};
+use super::util::{make_icon, set_startup, startup_enabled, wide, CONTROLLER_CLASS};
 use crate::audio::capture::{CaptureThread, WM_APP_REDRAW, WM_APP_STREAM};
-use crate::config::{Config, DEFAULT_TOML};
+use crate::config::{parse_hex_color, Config};
 use crate::dsp::analyzer::BINS;
+use crate::dsp::direction::angle_to_bins;
 use crate::hotkey;
 use crate::state::Shared;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering::*;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +32,7 @@ use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::*;
+use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -36,6 +43,14 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const HOTKEY_ID: i32 = 1;
+/// Controller timers.
+const TIMER_SAVE: usize = 1;
+const TIMER_PREVIEW: usize = 2;
+const SAVE_DELAY_MS: u32 = 600;
+const PREVIEW_MS: u64 = 2000;
+
+/// The settings window, if open (for IsDialogMessage in the message loop).
+static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
 struct App {
     hinst: HINSTANCE,
@@ -46,7 +61,11 @@ struct App {
     capture: CaptureThread,
     overlay: Overlay,
     tray: Tray,
-    calib: Option<HWND>,
+    settings: Option<SettingsWindow>,
+    /// Config the current overlay windows were built with (to detect rebuilds).
+    overlay_cfg: Config,
+    preview_until: Option<Instant>,
+    save_pending: bool,
     hotkey_label: String,
     frame_interval: Duration,
     last_frame: Instant,
@@ -103,7 +122,7 @@ fn load_config(path: &PathBuf) -> (Config, Option<String>) {
             Err(e) => (Config::default(), Some(format!("Using defaults. {e}"))),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = std::fs::write(path, DEFAULT_TOML);
+            let _ = std::fs::write(path, Config::default().to_toml());
             (Config::default(), None)
         }
         Err(e) => (
@@ -155,7 +174,11 @@ fn init() -> Result<()> {
         let shared = Arc::new(Shared::new());
         shared.notify_hwnd.store(hwnd.0 as isize, SeqCst);
         let _ = SHARED.set(shared.clone());
-        calibrate::register_class(hinst, icon, shared.clone(), hwnd)?;
+        settings::register_class(hinst, icon, shared.clone(), hwnd)?;
+        // Keep the Run entry pointing at this exe if it was moved.
+        if startup_enabled() {
+            set_startup(true);
+        }
 
         let mut overlay = Overlay::new(hinst, &cfg)?;
         let visible = cfg.general.start_visible;
@@ -185,7 +208,10 @@ fn init() -> Result<()> {
             capture,
             overlay,
             tray,
-            calib: None,
+            settings: None,
+            overlay_cfg: cfg.clone(),
+            preview_until: None,
+            save_pending: false,
             hotkey_label: String::new(),
             frame_interval: frame_interval(&cfg),
             last_frame: Instant::now(),
@@ -199,6 +225,10 @@ fn init() -> Result<()> {
             app.tray.balloon("SoundSight config error", &e, true);
         }
         APP.with(|a| *a.borrow_mut() = Some(app));
+        // `SoundSight.exe --settings` opens the settings window right away.
+        if std::env::args().any(|a| a.eq_ignore_ascii_case("--settings")) {
+            with_app(|a| a.open_settings());
+        }
         Ok(())
     }
 }
@@ -229,6 +259,11 @@ fn message_loop() {
                 if msg.message == WM_QUIT {
                     return;
                 }
+                // Tab / arrow-key navigation between the settings controls.
+                let sw = SETTINGS_HWND.load(Relaxed);
+                if sw != 0 && IsDialogMessageW(HWND(sw as _), &msg).as_bool() {
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -237,7 +272,7 @@ fn message_loop() {
 }
 
 impl App {
-    fn register_hotkey(&mut self, cfg: &Config) {
+    fn register_hotkey(&mut self, cfg: &Config) -> bool {
         unsafe {
             let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
         }
@@ -250,13 +285,24 @@ impl App {
                 .is_ok()
                 {
                     self.hotkey_label = cfg.general.hotkey.clone();
-                } else {
-                    let msg = format!("Hotkey {} is already used by another program. Use the tray menu, or pick another in the config.", cfg.general.hotkey);
-                    self.tray.balloon("SoundSight hotkey", &msg, true);
+                    if let Some(s) = &self.settings {
+                        s.set_hotkey_note("");
+                    }
+                    return true;
+                }
+                let msg = format!("{} is already used by another program.", cfg.general.hotkey);
+                match &self.settings {
+                    Some(s) => s.set_hotkey_note(&msg),
+                    None => self.tray.balloon(
+                        "SoundSight hotkey",
+                        &format!("{msg} Pick another in Settings."),
+                        true,
+                    ),
                 }
             }
             Err(e) => self.tray.balloon("SoundSight hotkey", &e, true),
         }
+        false
     }
 
     fn update_tip(&mut self) {
@@ -275,7 +321,7 @@ impl App {
 
     /// Capture runs only while something displays its output.
     fn update_wanted(&mut self) {
-        let wanted = self.overlay.is_visible() || self.calib.is_some();
+        let wanted = self.overlay.is_visible() || self.settings.is_some();
         if self.shared.wanted.swap(wanted, SeqCst) != wanted {
             self.capture.wake();
         }
@@ -292,6 +338,9 @@ impl App {
             // Clear first so no stale bars flash when shown again.
             self.overlay.render(&[0; BINS]);
             self.overlay.hide();
+        }
+        if let Some(s) = &self.settings {
+            s.set_visible_checkbox(v);
         }
         self.update_wanted();
         self.update_tip();
@@ -321,16 +370,41 @@ impl App {
     fn draw_frame(&mut self) {
         // Clear the flag *before* reading so an update racing with us posts a new message.
         self.shared.redraw_pending.store(false, Release);
-        let mut bins = [0u8; BINS];
-        self.shared.read_bins(&mut bins);
+        let bins = self.current_bins();
         if self.overlay.is_visible() {
             self.overlay.render(&bins);
         }
         self.last_frame = Instant::now();
     }
 
+    /// Live bins, plus the preview pattern for a moment after a settings change.
+    fn current_bins(&mut self) -> [u8; BINS] {
+        let mut bins = [0u8; BINS];
+        self.shared.read_bins(&mut bins);
+        if let Some(until) = self.preview_until {
+            if Instant::now() < until {
+                // Front-right, behind-left and a quieter one on the left.
+                for (deg, v) in [(30.0, 235u8), (-135.0, 170), (-80.0, 90)] {
+                    let (lo, _, _) = angle_to_bins(deg, BINS);
+                    bins[lo] = bins[lo].max(v);
+                }
+            } else {
+                self.preview_until = None;
+            }
+        }
+        bins
+    }
+
+    fn start_preview(&mut self) {
+        self.preview_until = Some(Instant::now() + Duration::from_millis(PREVIEW_MS));
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_PREVIEW, PREVIEW_MS as u32 + 50, None);
+        }
+    }
+
     fn rebuild_overlay(&mut self) {
         let cfg = self.config.lock().map(|c| c.clone()).unwrap_or_default();
+        self.overlay_cfg = cfg.clone();
         let visible = self.overlay.is_visible();
         match Overlay::new(self.hinst, &cfg) {
             Ok(mut ov) => {
@@ -360,12 +434,147 @@ impl App {
         self.rebuild_overlay();
         self.capture.request_reinit();
         self.update_tip();
+        if let Some(s) = &self.settings {
+            s.load(&cfg, startup_enabled());
+        }
         self.tray.balloon("SoundSight", "Config reloaded.", false);
+    }
+
+    fn save_now(&mut self) {
+        self.save_pending = false;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_SAVE);
+        }
+        let text = self.config.lock().map(|c| c.to_toml()).unwrap_or_default();
+        if let Err(e) = std::fs::write(&self.config_path, text) {
+            let msg = format!("Settings could not be saved to {}: {e}. Move SoundSight.exe to a folder you can write to.", self.config_path.display());
+            self.tray.balloon("SoundSight", &msg, true);
+        }
+    }
+
+    /// Apply a new config from the settings window.
+    fn apply_settings(&mut self, new: Config, e: &settings::Effect) {
+        if let Ok(mut c) = self.config.lock() {
+            *c = new.clone();
+        }
+        if e.overlay {
+            if Overlay::needs_rebuild(&self.overlay_cfg, &new) {
+                if !e.dragging {
+                    self.rebuild_overlay();
+                }
+            } else {
+                let bins = self.current_bins();
+                self.overlay.set_style(&new, &bins);
+            }
+            self.start_preview();
+            self.draw_frame();
+        }
+        if e.detection {
+            self.shared.params_version.fetch_add(1, Release);
+            self.capture.wake();
+        }
+        if e.hotkey {
+            self.register_hotkey(&new);
+            self.update_tip();
+        }
+        if e.config_changed() {
+            self.save_pending = true;
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_SAVE, SAVE_DELAY_MS, None);
+            }
+        }
+    }
+
+    fn settings_control(&mut self, id: i32, code: u32) {
+        match id {
+            settings::ID_CLOSE => return self.close_settings(),
+            settings::ID_OPENCFG => {
+                self.save_now();
+                return self.edit_config();
+            }
+            settings::ID_DEFAULTS => {
+                let mut d = Config::default();
+                // Keep the hotkey: resetting it is surprising.
+                d.general.hotkey = self
+                    .config
+                    .lock()
+                    .map(|c| c.general.hotkey.clone())
+                    .unwrap_or(d.general.hotkey);
+                if let Some(s) = &self.settings {
+                    s.load(&d, startup_enabled());
+                }
+                let e = settings::Effect {
+                    overlay: true,
+                    detection: true,
+                    hotkey: true,
+                    ..Default::default()
+                };
+                return self.apply_settings(d, &e);
+            }
+            _ => {}
+        }
+        let Some(win) = &self.settings else { return };
+        let mut cfg = self.config.lock().map(|c| c.clone()).unwrap_or_default();
+        let e = win.apply_control(id, code, &mut cfg);
+        if let Some(v) = e.visible {
+            self.set_visible(v);
+        }
+        if let Some(on) = e.startup {
+            if !set_startup(on) {
+                self.tray.balloon(
+                    "SoundSight",
+                    "Could not change the Windows startup setting.",
+                    true,
+                );
+            }
+        }
+        if e.config_changed() {
+            self.apply_settings(cfg, &e);
+        }
+    }
+
+    fn open_settings(&mut self) {
+        if let Some(s) = &self.settings {
+            unsafe {
+                let _ = ShowWindow(s.hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(s.hwnd);
+            }
+            return;
+        }
+        let cfg = self.config.lock().map(|c| c.clone()).unwrap_or_default();
+        match SettingsWindow::open(self.hinst, &cfg, startup_enabled()) {
+            Ok(win) => {
+                win.set_visible_checkbox(self.overlay.is_visible());
+                SETTINGS_HWND.store(win.hwnd.0 as isize, Relaxed);
+                self.settings = Some(win);
+                // Show what the current style looks like.
+                self.start_preview();
+                self.draw_frame();
+                if !self.register_hotkey(&cfg) {
+                    // note shown in the window
+                }
+            }
+            Err(e) => self
+                .tray
+                .balloon("SoundSight", &format!("Cannot open settings: {e}"), true),
+        }
+        self.update_wanted();
+    }
+
+    fn close_settings(&mut self) {
+        if let Some(s) = self.settings.take() {
+            SETTINGS_HWND.store(0, Relaxed);
+            s.destroy();
+        }
+        if self.save_pending {
+            self.save_now();
+        }
+        self.update_wanted();
     }
 
     fn edit_config(&mut self) {
         if !self.config_path.exists() {
-            let _ = std::fs::write(&self.config_path, DEFAULT_TOML);
+            self.save_now();
         }
         let path = wide(&self.config_path.to_string_lossy());
         unsafe {
@@ -380,39 +589,79 @@ impl App {
         }
     }
 
-    fn toggle_calibration(&mut self) {
-        if let Some(h) = self.calib.take() {
-            unsafe {
-                let _ = DestroyWindow(h);
-            }
-        } else if let Ok(h) = calibrate::open(self.hinst) {
-            self.calib = Some(h);
-        }
-        self.update_wanted();
-    }
-
     fn command(&mut self, cmd: u32) {
         match cmd {
             tray::CMD_TOGGLE => self.set_visible(!self.overlay.is_visible()),
-            tray::CMD_CALIBRATE => self.toggle_calibration(),
+            tray::CMD_SETTINGS => self.open_settings(),
             tray::CMD_RELOAD => self.reload_config(),
-            tray::CMD_EDIT_CONFIG => self.edit_config(),
             tray::CMD_QUIT => self.quit(),
             _ => {}
         }
     }
 
     fn quit(&mut self) {
-        if let Some(h) = self.calib.take() {
-            unsafe {
-                let _ = DestroyWindow(h);
-            }
+        self.close_settings();
+        if self.save_pending {
+            self.save_now();
         }
         self.tray.remove();
         unsafe {
             let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
             let _ = DestroyWindow(self.hwnd); // WM_DESTROY -> PostQuitMessage
         }
+    }
+}
+
+/// Called by the settings window procedure for every control notification.
+pub(super) fn on_settings_control(id: i32, code: u32) {
+    if id == settings::ID_COLOR && code == BN_CLICKED {
+        // The colour dialog runs a modal loop: don't hold the app borrow across it.
+        let Some((owner, current)) = with_app(|a| {
+            let c = a
+                .config
+                .lock()
+                .map(|c| c.color_rgb())
+                .unwrap_or((255, 59, 48));
+            (a.settings.as_ref().map(|s| s.hwnd).unwrap_or_default(), c)
+        }) else {
+            return;
+        };
+        if let Some((r, g, b)) = pick_color(owner, current) {
+            with_app(|a| {
+                let mut cfg = a.config.lock().map(|c| c.clone()).unwrap_or_default();
+                cfg.overlay.color = format!("#{r:02X}{g:02X}{b:02X}");
+                debug_assert!(parse_hex_color(&cfg.overlay.color).is_some());
+                if let Some(s) = &a.settings {
+                    s.set_color((r, g, b));
+                }
+                let e = settings::Effect {
+                    overlay: true,
+                    ..Default::default()
+                };
+                a.apply_settings(cfg, &e);
+            });
+        }
+        return;
+    }
+    with_app(|a| a.settings_control(id, code));
+}
+
+fn pick_color(owner: HWND, (r, g, b): (u8, u8, u8)) -> Option<(u8, u8, u8)> {
+    static mut CUSTOM: [COLORREF; 16] = [COLORREF(0x00FFFFFF); 16];
+    let mut cc = CHOOSECOLORW {
+        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: owner,
+        rgbResult: COLORREF(((b as u32) << 16) | ((g as u32) << 8) | r as u32),
+        // Only touched from the UI thread.
+        lpCustColors: std::ptr::addr_of_mut!(CUSTOM) as *mut COLORREF,
+        Flags: CC_RGBINIT | CC_FULLOPEN,
+        ..Default::default()
+    };
+    if unsafe { ChooseColorW(&mut cc) }.as_bool() {
+        let c = cc.rgbResult.0;
+        Some((c as u8, (c >> 8) as u8, (c >> 16) as u8))
+    } else {
+        None
     }
 }
 
@@ -450,7 +699,7 @@ unsafe extern "system" fn controller_wndproc(
                 return LRESULT(0);
             }
             WM_APP_STREAM => {
-                // Stream started/stopped; the calibration window polls the format itself.
+                // Stream started/stopped; the settings window polls the format itself.
                 return LRESULT(0);
             }
             WM_HOTKEY if wp.0 as i32 == HOTKEY_ID => {
@@ -461,22 +710,42 @@ unsafe extern "system" fn controller_wndproc(
                 let event = (lp.0 & 0xFFFF) as u32;
                 if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                     // Read state, release the borrow, then run the modal menu loop.
-                    let Some((visible, calibrating)) =
-                        with_app(|a| (a.overlay.is_visible(), a.calib.is_some()))
-                    else {
+                    let Some(visible) = with_app(|a| a.overlay.is_visible()) else {
                         return LRESULT(0);
                     };
-                    let cmd = Tray::show_menu(hwnd, visible, calibrating);
+                    let cmd = Tray::show_menu(hwnd, visible);
                     with_app(|a| a.command(cmd));
-                } else if event == WM_LBUTTONDBLCLK {
-                    with_app(|a| a.set_visible(!a.overlay.is_visible()));
+                } else if event == WM_LBUTTONDBLCLK || event == WM_LBUTTONUP {
+                    with_app(|a| a.open_settings());
                 }
                 return LRESULT(0);
             }
-            WM_APP_CALIB_CLOSED => {
+            WM_APP_SETTINGS_CLOSED => {
+                // Closed with the title-bar X (the window is already destroyed).
                 with_app(|a| {
-                    a.calib = None;
+                    if a.settings.take().is_some() {
+                        SETTINGS_HWND.store(0, Relaxed);
+                    }
+                    if a.save_pending {
+                        a.save_now();
+                    }
                     a.update_wanted();
+                });
+                return LRESULT(0);
+            }
+            WM_TIMER if wp.0 == TIMER_SAVE => {
+                with_app(|a| a.save_now());
+                return LRESULT(0);
+            }
+            WM_TIMER if wp.0 == TIMER_PREVIEW => {
+                let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
+                with_app(|a| {
+                    // Thumb released while dragging a size slider: rebuild now.
+                    let cfg = a.config.lock().map(|c| c.clone()).unwrap_or_default();
+                    if Overlay::needs_rebuild(&a.overlay_cfg, &cfg) {
+                        a.rebuild_overlay();
+                    }
+                    a.draw_frame();
                 });
                 return LRESULT(0);
             }

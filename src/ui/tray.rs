@@ -8,9 +8,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
 
 pub const CMD_TOGGLE: u32 = 1;
-pub const CMD_CALIBRATE: u32 = 2;
+pub const CMD_SETTINGS: u32 = 2;
 pub const CMD_RELOAD: u32 = 3;
-pub const CMD_EDIT_CONFIG: u32 = 4;
 pub const CMD_QUIT: u32 = 5;
 
 pub struct Tray {
@@ -72,7 +71,7 @@ impl Tray {
 
     /// Show the context menu at the cursor; returns the chosen command (0 = none).
     /// Runs a modal loop: callers must not hold borrows of app state across it.
-    pub fn show_menu(hwnd: HWND, overlay_visible: bool, calibrating: bool) -> u32 {
+    pub fn show_menu(hwnd: HWND, overlay_visible: bool) -> u32 {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else {
                 return 0;
@@ -80,30 +79,24 @@ impl Tray {
             let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
             let _ = AppendMenuW(
                 menu,
+                MF_STRING,
+                CMD_SETTINGS as usize,
+                windows::core::w!("Settings && speaker test..."),
+            );
+            let _ = SetMenuDefaultItem(menu, CMD_SETTINGS, 0);
+            let _ = AppendMenuW(
+                menu,
                 MF_STRING | check(overlay_visible),
                 CMD_TOGGLE as usize,
                 windows::core::w!("Show overlay"),
             );
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING | check(calibrating),
-                CMD_CALIBRATE as usize,
-                windows::core::w!("Calibrate / speaker test..."),
-            );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                CMD_EDIT_CONFIG as usize,
-                windows::core::w!("Edit config"),
-            );
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
                 CMD_RELOAD as usize,
-                windows::core::w!("Reload config"),
+                windows::core::w!("Reload config file"),
             );
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,

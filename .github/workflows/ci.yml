@@ -42,6 +42,10 @@ jobs:
           $banned = $imports | Select-String -Pattern 'OpenProcess|ReadProcessMemory|WriteProcessMemory|CreateRemoteThread|VirtualAllocEx|SetWindowsHookEx'
           if ($banned) { Write-Error "Banned API imported: $banned"; exit 1 }
           "OK: only Windows system DLLs, no process-access or hook APIs."
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if (-not $text.Contains("Microsoft.Windows.Common-Controls")) { Write-Error "Manifest (Common Controls v6) not embedded"; exit 1 }
+          "OK: application manifest embedded."
 
       - uses: actions/upload-artifact@v4
         with:

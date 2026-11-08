@@ -1,6 +1,6 @@
-//! Win32 UI: overlay strips, tray icon, calibration window, app loop.
+//! Win32 UI: overlay windows, tray icon, settings window, app loop.
 pub mod app;
-pub mod calibrate;
 pub mod overlay;
+pub mod settings;
 pub mod tray;
 pub mod util;

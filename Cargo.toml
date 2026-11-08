@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Visual sound radar overlay for deaf and hard-of-hearing gamers (WASAPI loopback only)"
 default-run = "SoundSight"
+build = "build.rs"
 
 [lib]
 name = "soundsight"
@@ -37,6 +38,9 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
     "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
 ]
 
 # Already a dependency of `windows`; needed directly by the #[implement] COM macro.

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering::
 pub struct Shared {
     pub bins: [AtomicU8; BINS],
     pub meters: [AtomicU8; MAX_CHANNELS],
-    /// Stream format info for the calibration window.
+    /// Stream format info for the settings window (speaker test).
     pub channels: AtomicU32,
     pub channel_mask: AtomicU32,
     pub sample_rate: AtomicU32,
@@ -19,7 +19,7 @@ pub struct Shared {
     pub capturing: AtomicBool,
     /// Surround device carrying stereo-only content (FL/FR mapped to hard left/right).
     pub stereo_content: AtomicBool,
-    /// Overlay visible or calibration window open -> capture should run.
+    /// Overlay visible or settings window open -> capture should run.
     pub wanted: AtomicBool,
     /// A redraw message is queued and not yet handled.
     pub redraw_pending: AtomicBool,
@@ -27,6 +27,9 @@ pub struct Shared {
     pub notify_hwnd: AtomicIsize,
     /// Set by the UI to ask the capture thread to re-read the config / re-open the device.
     pub reinit_requested: AtomicBool,
+    /// Bumped by the UI when detection settings change; the capture thread rebuilds
+    /// its analyser on the next wakeup.
+    pub params_version: AtomicU32,
     pub quit: AtomicBool,
 }
 
@@ -44,6 +47,7 @@ impl Shared {
             redraw_pending: AtomicBool::new(false),
             notify_hwnd: AtomicIsize::new(0),
             reinit_requested: AtomicBool::new(false),
+            params_version: AtomicU32::new(0),
             quit: AtomicBool::new(false),
         }
     }
