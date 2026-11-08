@@ -20,19 +20,36 @@ const BUTTERWORTH_Q: f32 = core::f32::consts::FRAC_1_SQRT_2;
 impl Biquad {
     /// Pass-through filter.
     pub fn identity() -> Self {
-        Biquad { b0: 1.0, ..Default::default() }
+        Biquad {
+            b0: 1.0,
+            ..Default::default()
+        }
     }
 
     pub fn highpass(sample_rate: f32, freq: f32) -> Self {
         let (cos_w, alpha) = Self::prewarp(sample_rate, freq);
         let a0 = 1.0 + alpha;
-        Self::normalised((1.0 + cos_w) / 2.0, -(1.0 + cos_w), (1.0 + cos_w) / 2.0, a0, -2.0 * cos_w, 1.0 - alpha)
+        Self::normalised(
+            (1.0 + cos_w) / 2.0,
+            -(1.0 + cos_w),
+            (1.0 + cos_w) / 2.0,
+            a0,
+            -2.0 * cos_w,
+            1.0 - alpha,
+        )
     }
 
     pub fn lowpass(sample_rate: f32, freq: f32) -> Self {
         let (cos_w, alpha) = Self::prewarp(sample_rate, freq);
         let a0 = 1.0 + alpha;
-        Self::normalised((1.0 - cos_w) / 2.0, 1.0 - cos_w, (1.0 - cos_w) / 2.0, a0, -2.0 * cos_w, 1.0 - alpha)
+        Self::normalised(
+            (1.0 - cos_w) / 2.0,
+            1.0 - cos_w,
+            (1.0 - cos_w) / 2.0,
+            a0,
+            -2.0 * cos_w,
+            1.0 - alpha,
+        )
     }
 
     fn prewarp(sample_rate: f32, freq: f32) -> (f32, f32) {
@@ -43,7 +60,15 @@ impl Biquad {
     }
 
     fn normalised(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
-        Biquad { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0.0, z2: 0.0 }
+        Biquad {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     #[inline(always)]
@@ -106,7 +131,10 @@ mod tests {
         let g40 = gain(mk(), sr, 40.0);
         let g15k = gain(mk(), sr, 15_000.0);
         assert!((g1k - 1.0).abs() < 0.05, "passband gain {g1k}");
-        assert!((g200 - core::f32::consts::FRAC_1_SQRT_2).abs() < 0.05, "-3 dB at corner, got {g200}");
+        assert!(
+            (g200 - core::f32::consts::FRAC_1_SQRT_2).abs() < 0.05,
+            "-3 dB at corner, got {g200}"
+        );
         assert!(g40 < 0.06, "40 Hz should be strongly attenuated, got {g40}");
         assert!(g15k < 0.1, "15 kHz should be attenuated, got {g15k}");
     }

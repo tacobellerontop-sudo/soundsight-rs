@@ -31,7 +31,12 @@ pub struct General {
 
 impl Default for General {
     fn default() -> Self {
-        General { hotkey: "F10".into(), start_visible: true, refresh_hz: 60, mmcss: false }
+        General {
+            hotkey: "F10".into(),
+            start_visible: true,
+            refresh_hz: 60,
+            mmcss: false,
+        }
     }
 }
 
@@ -122,7 +127,11 @@ pub struct Heuristics {
 
 impl Default for Heuristics {
     fn default() -> Self {
-        Heuristics { enabled: true, max_center_ratio: 0.6, min_focus: 0.15 }
+        Heuristics {
+            enabled: true,
+            max_center_ratio: 0.6,
+            min_focus: 0.15,
+        }
     }
 }
 
@@ -142,7 +151,13 @@ pub struct SpeakerAngles {
 
 impl Default for SpeakerAngles {
     fn default() -> Self {
-        SpeakerAngles { front: 30.0, side: 90.0, back: 150.0, surround_pair: 110.0, stereo: 90.0 }
+        SpeakerAngles {
+            front: 30.0,
+            side: 90.0,
+            back: 150.0,
+            surround_pair: 110.0,
+            stereo: 90.0,
+        }
     }
 }
 
@@ -225,7 +240,9 @@ mod tests {
 
     #[test]
     fn sanitize_clamps() {
-        let c = Config::parse("[general]\nrefresh_hz = 0\n[detection]\nmin_db = -10\nmax_db = -20\n").unwrap();
+        let c =
+            Config::parse("[general]\nrefresh_hz = 0\n[detection]\nmin_db = -10\nmax_db = -20\n")
+                .unwrap();
         assert_eq!(c.general.refresh_hz, 1);
         assert!(c.detection.max_db > c.detection.min_db);
     }

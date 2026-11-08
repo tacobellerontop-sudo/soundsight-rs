@@ -8,6 +8,7 @@
 //! It sleeps in `WaitForMultipleObjects` on two events:
 //!   * the WASAPI buffer event (a packet is ready, ~every 10 ms while audio plays)
 //!   * a control event (device changed, config reload, show/hide, quit)
+//!
 //! The only timeout is used while bars are fading out and no packets arrive (loopback
 //! streams deliver nothing while the system is silent). When everything is faded and
 //! silent, the wait is INFINITE: zero CPU.
@@ -20,7 +21,9 @@ use std::sync::atomic::Ordering::*;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::{implement, w, Result, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, PROPERTYKEY, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, PROPERTYKEY, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
@@ -56,7 +59,11 @@ impl CaptureThread {
             .stack_size(256 * 1024)
             .spawn(move || capture_thread(sh, config, HANDLE(raw as _)))
             .expect("spawn capture thread");
-        Ok(CaptureThread { control, shared, join: Some(join) })
+        Ok(CaptureThread {
+            control,
+            shared,
+            join: Some(join),
+        })
     }
 
     /// Wake the thread so it re-checks `Shared::{wanted, reinit_requested, quit}`.
@@ -112,7 +119,10 @@ impl DeviceNotifier {
             return false;
         }
         let id = unsafe { id.as_wide() };
-        self.current_id.lock().map(|c| c.as_slice() == id).unwrap_or(false)
+        self.current_id
+            .lock()
+            .map(|c| c.as_slice() == id)
+            .unwrap_or(false)
     }
 }
 
@@ -171,7 +181,11 @@ struct Stream {
 }
 
 impl Stream {
-    fn open(enumerator: &IMMDeviceEnumerator, audio_event: HANDLE, current_id: &Mutex<Vec<u16>>) -> Result<Stream> {
+    fn open(
+        enumerator: &IMMDeviceEnumerator,
+        audio_event: HANDLE,
+        current_id: &Mutex<Vec<u16>>,
+    ) -> Result<Stream> {
         unsafe {
             let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
             let id = device.GetId()?;
@@ -193,13 +207,20 @@ impl Stream {
                     pwfx,
                     None,
                 ),
-                None => Err(windows::core::Error::from_hresult(AUDCLNT_E_UNSUPPORTED_FORMAT)),
+                None => Err(windows::core::Error::from_hresult(
+                    AUDCLNT_E_UNSUPPORTED_FORMAT,
+                )),
             };
             CoTaskMemFree(Some(pwfx as _));
             init?;
             client.SetEventHandle(audio_event)?;
             let capture: IAudioCaptureClient = client.GetService()?;
-            Ok(Stream { client, capture, format: format.unwrap(), running: false })
+            Ok(Stream {
+                client,
+                capture,
+                format: format.unwrap(),
+                running: false,
+            })
         }
     }
 
@@ -233,15 +254,22 @@ impl Stream {
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let mut frames = 0u32;
                 let mut flags = 0u32;
-                self.capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                self.capture
+                    .GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
                 let n = frames as usize * ch;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
                     analyzer.process_silence(frames as usize);
                 } else {
                     match self.format.kind {
-                        SampleKind::F32 => analyzer.process(std::slice::from_raw_parts(data as *const f32, n)),
-                        SampleKind::I16 => analyzer.process(std::slice::from_raw_parts(data as *const i16, n)),
-                        SampleKind::I32 => analyzer.process(std::slice::from_raw_parts(data as *const i32, n)),
+                        SampleKind::F32 => {
+                            analyzer.process(std::slice::from_raw_parts(data as *const f32, n))
+                        }
+                        SampleKind::I16 => {
+                            analyzer.process(std::slice::from_raw_parts(data as *const i16, n))
+                        }
+                        SampleKind::I32 => {
+                            analyzer.process(std::slice::from_raw_parts(data as *const i32, n))
+                        }
                     };
                 }
                 self.capture.ReleaseBuffer(frames)?;
@@ -279,7 +307,12 @@ fn parse_format(pwfx: *const WAVEFORMATEX) -> Option<StreamFormat> {
         if channels == 0 {
             return None;
         }
-        Some(StreamFormat { sample_rate: wfx.nSamplesPerSec, channels, channel_mask: mask, kind })
+        Some(StreamFormat {
+            sample_rate: wfx.nSamplesPerSec,
+            channels,
+            channel_mask: mask,
+            kind,
+        })
     }
 }
 
@@ -321,10 +354,15 @@ fn capture_thread(shared: Arc<Shared>, config: Arc<Mutex<Config>>, control: HAND
 }
 
 fn run(shared: &Arc<Shared>, config: &Arc<Mutex<Config>>, control: HANDLE) -> Result<()> {
-    let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
     let current_id = Arc::new(Mutex::new(Vec::with_capacity(128)));
-    let notifier: IMMNotificationClient =
-        DeviceNotifier { shared: shared.clone(), control: control.0 as isize, current_id: current_id.clone() }.into();
+    let notifier: IMMNotificationClient = DeviceNotifier {
+        shared: shared.clone(),
+        control: control.0 as isize,
+        current_id: current_id.clone(),
+    }
+    .into();
     unsafe { enumerator.RegisterEndpointNotificationCallback(&notifier)? };
 
     let audio_event = unsafe { CreateEventW(None, false, false, None)? };
@@ -391,14 +429,24 @@ fn run(shared: &Arc<Shared>, config: &Arc<Mutex<Config>>, control: HANDLE) -> Re
 }
 
 /// The steady-state loop. No allocation, no polling.
-fn pump(shared: &Shared, stream: &mut Stream, analyzer: &mut Analyzer, audio_event: HANDLE, control: HANDLE) -> Exit {
+fn pump(
+    shared: &Shared,
+    stream: &mut Stream,
+    analyzer: &mut Analyzer,
+    audio_event: HANDLE,
+    control: HANDLE,
+) -> Exit {
     let handles = [audio_event, control];
     let mut qbins = [0u8; BINS];
     let mut qmeters = [0u8; MAX_CHANNELS];
     let mut last = Instant::now();
 
     loop {
-        let timeout = if analyzer.is_idle() { u32::MAX } else { FADE_TICK_MS };
+        let timeout = if analyzer.is_idle() {
+            u32::MAX
+        } else {
+            FADE_TICK_MS
+        };
         let r = unsafe { WaitForMultipleObjects(&handles, false, timeout) };
 
         if r == WAIT_OBJECT_0 {
@@ -459,4 +507,3 @@ fn wait_one(h: HANDLE, ms: u32) {
         WaitForSingleObject(h, ms);
     }
 }
-

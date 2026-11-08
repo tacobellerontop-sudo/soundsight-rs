@@ -210,7 +210,11 @@ impl Analyzer {
 
             let floor = self.floor[c];
             eff[c] = (e - floor).max(0.0);
-            let a = if e > floor { self.floor_rise_a } else { self.floor_fall_a };
+            let a = if e > floor {
+                self.floor_rise_a
+            } else {
+                self.floor_fall_a
+            };
             self.floor[c] = floor + a * (e - floor);
 
             let directional = self.layout.vectors[c] != (0.0, 0.0);
@@ -226,7 +230,9 @@ impl Analyzer {
         if total <= floor_total * self.snr_lin || total <= f32::MIN_POSITIVE {
             return;
         }
-        let Some(dir) = estimate(&eff[..n], &self.layout.vectors[..n]) else { return };
+        let Some(dir) = estimate(&eff[..n], &self.layout.vectors[..n]) else {
+            return;
+        };
 
         let db = energy_to_db(dir.total);
         let intensity = ((db - self.min_db) / (self.max_db - self.min_db)).clamp(0.0, 1.0);
@@ -235,7 +241,10 @@ impl Analyzer {
         }
 
         if self.heur_enabled {
-            let center: f32 = (0..n).filter(|&c| self.layout.is_center[c]).map(|c| eff[c]).sum();
+            let center: f32 = (0..n)
+                .filter(|&c| self.layout.is_center[c])
+                .map(|c| eff[c])
+                .sum();
             if center / dir.total > self.max_center_ratio || dir.focus < self.min_focus {
                 return;
             }
@@ -341,7 +350,11 @@ mod tests {
     }
 
     fn peak_bin_angle(a: &Analyzer) -> f32 {
-        let (i, _) = a.bins().iter().enumerate().fold((0, 0.0f32), |acc, (i, &b)| if b > acc.1 { (i, b) } else { acc });
+        let (i, _) =
+            a.bins().iter().enumerate().fold(
+                (0, 0.0f32),
+                |acc, (i, &b)| if b > acc.1 { (i, b) } else { acc },
+            );
         bin_center_deg(i, BINS)
     }
 
@@ -352,7 +365,11 @@ mod tests {
         // FL FR C LFE BL BR SL SR: sound panned between BR (150) and SR (90) -> ~120.
         a.process(&tone(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.3], 100));
         let ev = a.last_event.expect("burst should be detected");
-        assert!(normalize_deg(ev.dir.angle_deg - 120.0).abs() < 1.0, "{}", ev.dir.angle_deg);
+        assert!(
+            normalize_deg(ev.dir.angle_deg - 120.0).abs() < 1.0,
+            "{}",
+            ev.dir.angle_deg
+        );
         assert!(normalize_deg(peak_bin_angle(&a) - 120.0).abs() <= 10.0);
         assert!(ev.intensity > 0.5);
     }
@@ -374,7 +391,10 @@ mod tests {
         let (on, off) = (rumble(true), rumble(false));
         // 2nd-order HP at 200 Hz: 30 Hz is ~33 dB down = ~0.8 of the 42 dB intensity range.
         assert!(off > 0.95, "unfiltered rumble is loud: {off}");
-        assert!(on < off - 0.5, "band-pass should strongly reduce 30 Hz: on={on} off={off}");
+        assert!(
+            on < off - 0.5,
+            "band-pass should strongly reduce 30 Hz: on={on} off={off}"
+        );
     }
 
     #[test]
@@ -386,7 +406,10 @@ mod tests {
         for _ in 0..80 {
             a.process(&chunk);
         }
-        assert!(a.last_event.is_none(), "steady sound should be absorbed by the noise floor");
+        assert!(
+            a.last_event.is_none(),
+            "steady sound should be absorbed by the noise floor"
+        );
         // A new transient on the right is still detected.
         a.process(&tone(&[0.2, 0.4], 50));
         let ev = a.last_event.expect("transient over music");

@@ -64,8 +64,16 @@ impl EdgeLayout {
         let (w, h) = (self.w as f32, self.h as f32);
         let r = angle_deg.to_radians();
         let (dx, dy) = (r.sin(), -r.cos()); // screen y grows downwards
-        let tx = if dx.abs() > 1e-9 { (w / 2.0) / dx.abs() } else { f32::INFINITY };
-        let ty = if dy.abs() > 1e-9 { (h / 2.0) / dy.abs() } else { f32::INFINITY };
+        let tx = if dx.abs() > 1e-9 {
+            (w / 2.0) / dx.abs()
+        } else {
+            f32::INFINITY
+        };
+        let ty = if dy.abs() > 1e-9 {
+            (h / 2.0) / dy.abs()
+        } else {
+            f32::INFINITY
+        };
         let t = tx.min(ty);
         let px = (w / 2.0 + t * dx).clamp(0.0, w);
         let py = (h / 2.0 + t * dy).clamp(0.0, h);
@@ -157,7 +165,14 @@ pub fn paint_frame(
 }
 
 /// Paint perimeter interval [a, b) (may extend past either end; wraps around).
-fn paint_interval(l: &EdgeLayout, bufs: &mut [&mut [u32]; 4], a: f32, b: f32, px: u32, drawn: &mut [bool; 4]) {
+fn paint_interval(
+    l: &EdgeLayout,
+    bufs: &mut [&mut [u32]; 4],
+    a: f32,
+    b: f32,
+    px: u32,
+    drawn: &mut [bool; 4],
+) {
     let p = l.perimeter();
     let len = (b - a).min(p);
     let a = a.rem_euclid(p);
@@ -169,10 +184,22 @@ fn paint_interval(l: &EdgeLayout, bufs: &mut [&mut [u32]; 4], a: f32, b: f32, px
 }
 
 /// Paint [a, b) with 0 <= a <= b <= perimeter.
-fn paint_segment(l: &EdgeLayout, bufs: &mut [&mut [u32]; 4], a: f32, b: f32, px: u32, drawn: &mut [bool; 4]) {
+fn paint_segment(
+    l: &EdgeLayout,
+    bufs: &mut [&mut [u32]; 4],
+    a: f32,
+    b: f32,
+    px: u32,
+    drawn: &mut [bool; 4],
+) {
     let (w, h, t) = (l.w as f32, l.h as f32, l.t);
     // (edge, perimeter start, perimeter end)
-    let edges = [(TOP, 0.0, w), (RIGHT, w, w + h), (BOTTOM, w + h, 2.0 * w + h), (LEFT, 2.0 * w + h, 2.0 * (w + h))];
+    let edges = [
+        (TOP, 0.0, w),
+        (RIGHT, w, w + h),
+        (BOTTOM, w + h, 2.0 * w + h),
+        (LEFT, 2.0 * w + h, 2.0 * (w + h)),
+    ];
     for (edge, e0, e1) in edges {
         let s0 = a.max(e0);
         let s1 = b.min(e1);
@@ -224,14 +251,19 @@ mod tests {
     use super::*;
     use crate::dsp::direction::angle_to_bins;
 
-    const L: EdgeLayout = EdgeLayout { w: 1920, h: 1080, t: 6 };
+    const L: EdgeLayout = EdgeLayout {
+        w: 1920,
+        h: 1080,
+        t: 6,
+    };
 
     #[test]
     fn cardinal_directions_hit_edge_centres() {
         assert!((L.angle_to_perimeter(0.0) - 960.0).abs() < 0.5); // top centre
         assert!((L.angle_to_perimeter(90.0) - (1920.0 + 540.0)).abs() < 0.5); // right centre
         assert!((L.angle_to_perimeter(180.0) - (1920.0 + 1080.0 + 960.0)).abs() < 0.5); // bottom centre
-        assert!((L.angle_to_perimeter(-90.0) - (2.0 * 1920.0 + 1080.0 + 540.0)).abs() < 0.5); // left centre
+        assert!((L.angle_to_perimeter(-90.0) - (2.0 * 1920.0 + 1080.0 + 540.0)).abs() < 0.5);
+        // left centre
     }
 
     #[test]
@@ -248,7 +280,10 @@ mod tests {
         for d in -178..=180 {
             let s = L.angle_to_perimeter(d as f32);
             let unwrapped = if s < prev - 1000.0 { s + 6000.0 } else { s };
-            assert!(unwrapped >= prev - 0.01, "not monotonic at {d}: {prev} -> {s}");
+            assert!(
+                unwrapped >= prev - 0.01,
+                "not monotonic at {d}: {prev} -> {s}"
+            );
             prev = unwrapped;
         }
         assert!(prev > start);
@@ -260,7 +295,13 @@ mod tests {
         let changed = {
             let [a, b, c, d] = &mut v;
             let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
-            paint_frame(&L, &Style::from_config(&Config::default()), bins, &mut bufs, &mut has)
+            paint_frame(
+                &L,
+                &Style::from_config(&Config::default()),
+                bins,
+                &mut bufs,
+                &mut has,
+            )
         };
         (v, changed)
     }
@@ -313,8 +354,15 @@ mod tests {
         let mut bufs: [&mut [u32]; 4] = [a, b, c, d];
         assert!(paint_frame(&L, &style, &bins, &mut bufs, &mut has)[RIGHT]);
         bins[9] = 0;
-        assert!(paint_frame(&L, &style, &bins, &mut bufs, &mut has)[RIGHT], "must push the cleared strip");
-        assert_eq!(paint_frame(&L, &style, &bins, &mut bufs, &mut has), [false; 4], "idle: nothing to push");
+        assert!(
+            paint_frame(&L, &style, &bins, &mut bufs, &mut has)[RIGHT],
+            "must push the cleared strip"
+        );
+        assert_eq!(
+            paint_frame(&L, &style, &bins, &mut bufs, &mut has),
+            [false; 4],
+            "idle: nothing to push"
+        );
         assert!(bufs[RIGHT].iter().all(|&p| p == 0));
     }
 

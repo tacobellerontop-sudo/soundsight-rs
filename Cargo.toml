@@ -3,7 +3,6 @@ name = "soundsight-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Visual sound radar overlay for deaf and hard-of-hearing gamers (WASAPI loopback only)"
-license = "MIT"
 default-run = "soundsight"
 
 [lib]

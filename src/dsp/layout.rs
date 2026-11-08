@@ -93,7 +93,11 @@ impl Layout {
     /// Build a layout from a channel count and WAVEFORMATEXTENSIBLE channel mask
     /// (pass 0 if the format had no mask).
     pub fn from_mask(channels: usize, mask: u32, angles: &SpeakerAngles) -> Layout {
-        let mask = if mask == 0 { default_mask(channels) } else { mask };
+        let mask = if mask == 0 {
+            default_mask(channels)
+        } else {
+            mask
+        };
         let mut speakers = [Speaker::Other; MAX_CHANNELS];
 
         // Channels are interleaved in ascending mask-bit order.
@@ -159,7 +163,14 @@ impl Layout {
             _ => "custom",
         };
 
-        Layout { channels, mask, speakers, vectors, is_center, name }
+        Layout {
+            channels,
+            mask,
+            speakers,
+            vectors,
+            is_center,
+            name,
+        }
     }
 
     /// Number of channels that are actually analysed.
@@ -169,7 +180,9 @@ impl Layout {
 
     /// True if the layout can tell front from back at all.
     pub fn has_rear(&self) -> bool {
-        self.vectors[..self.analysed_channels()].iter().any(|v| v.1 < -0.01)
+        self.vectors[..self.analysed_channels()]
+            .iter()
+            .any(|v| v.1 < -0.01)
     }
 }
 
@@ -210,7 +223,11 @@ mod tests {
     #[test]
     fn more_than_eight_channels_is_truncated() {
         // 7.1.4: 7.1 + four top speakers (bits 12, 14, 15, 17).
-        let l = Layout::from_mask(12, 0x63F | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 17), &angles());
+        let l = Layout::from_mask(
+            12,
+            0x63F | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 17),
+            &angles(),
+        );
         assert_eq!(l.analysed_channels(), 8);
         assert_eq!(l.speakers[7], Speaker::SideRight);
     }

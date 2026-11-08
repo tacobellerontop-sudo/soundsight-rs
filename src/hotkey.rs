@@ -22,11 +22,14 @@ pub fn parse(s: &str) -> Result<(u32, u32), String> {
                 if vk.is_some() {
                     return Err(format!("hotkey '{s}' has more than one key"));
                 }
-                vk = Some(key_code(key).ok_or_else(|| format!("unknown key '{part}' in hotkey '{s}'"))?);
+                vk = Some(
+                    key_code(key).ok_or_else(|| format!("unknown key '{part}' in hotkey '{s}'"))?,
+                );
             }
         }
     }
-    vk.map(|v| (mods, v)).ok_or_else(|| format!("hotkey '{s}' has no key"))
+    vk.map(|v| (mods, v))
+        .ok_or_else(|| format!("hotkey '{s}' has no key"))
 }
 
 fn key_code(k: &str) -> Option<u32> {
@@ -65,7 +68,10 @@ mod tests {
     #[test]
     fn parses() {
         assert_eq!(parse("F10"), Ok((MOD_NOREPEAT, 0x79)));
-        assert_eq!(parse("ctrl + shift + s"), Ok((MOD_NOREPEAT | MOD_CONTROL | MOD_SHIFT, b'S' as u32)));
+        assert_eq!(
+            parse("ctrl + shift + s"),
+            Ok((MOD_NOREPEAT | MOD_CONTROL | MOD_SHIFT, b'S' as u32))
+        );
         assert_eq!(parse("Alt+Numpad5"), Ok((MOD_NOREPEAT | MOD_ALT, 0x65)));
         assert_eq!(parse("Win+F24"), Ok((MOD_NOREPEAT | MOD_WIN, 0x87)));
     }

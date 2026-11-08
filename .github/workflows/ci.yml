@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+      - name: DSP benchmark
+        run: cargo run --release --example bench_dsp
+      - name: Release build
+        run: cargo build --release
+      - name: Binary size
+        shell: pwsh
+        run: "'{0:N0} bytes' -f (Get-Item target/release/soundsight.exe).Length"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soundsight-windows-x64
+          path: |
+            target/release/soundsight.exe
+            soundsight.default.toml
+            README.md

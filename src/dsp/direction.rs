@@ -41,8 +41,16 @@ pub fn estimate(energies: &[f32], vectors: &[(f32, f32)]) -> Option<DirectionEst
     }
     let len = (x * x + y * y).sqrt();
     // atan2(x, y): measured from the +y (front) axis towards +x (right) = clockwise.
-    let angle = if len <= total * 1e-6 { 0.0 } else { normalize_deg(x.atan2(y).to_degrees()) };
-    Some(DirectionEstimate { angle_deg: angle, focus: (len / total).min(1.0), total })
+    let angle = if len <= total * 1e-6 {
+        0.0
+    } else {
+        normalize_deg(x.atan2(y).to_degrees())
+    };
+    Some(DirectionEstimate {
+        angle_deg: angle,
+        focus: (len / total).min(1.0),
+        total,
+    })
 }
 
 /// Wrap an angle into (-180, 180].
@@ -104,7 +112,11 @@ mod tests {
             let mut e = [0.0; 8];
             e[ch] = 1.0;
             let d = est71(e);
-            assert!(close(d.angle_deg, want), "channel {ch}: got {} want {want}", d.angle_deg);
+            assert!(
+                close(d.angle_deg, want),
+                "channel {ch}: got {} want {want}",
+                d.angle_deg
+            );
             assert!((d.focus - 1.0).abs() < 1e-5);
         }
     }
@@ -112,13 +124,25 @@ mod tests {
     #[test]
     fn pairs_give_midpoints() {
         // FL+FR -> front
-        assert!(close(est71([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).angle_deg, 0.0));
+        assert!(close(
+            est71([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).angle_deg,
+            0.0
+        ));
         // FR+SR -> 60
-        assert!(close(est71([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]).angle_deg, 60.0));
+        assert!(close(
+            est71([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]).angle_deg,
+            60.0
+        ));
         // BL+BR -> directly behind
-        assert!(close(est71([0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]).angle_deg, 180.0));
+        assert!(close(
+            est71([0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]).angle_deg,
+            180.0
+        ));
         // SL+BL -> -120
-        assert!(close(est71([0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]).angle_deg, -120.0));
+        assert!(close(
+            est71([0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]).angle_deg,
+            -120.0
+        ));
     }
 
     #[test]
