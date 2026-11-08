@@ -4,6 +4,8 @@
 //! the capture/overlay/tray code is Windows-only.
 pub mod config;
 pub mod dsp;
+pub mod hotkey;
+pub mod render;
 pub mod state;
 
 #[cfg(windows)]
