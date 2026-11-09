@@ -2,3 +2,4 @@
 *.pdb
 soundsight.toml
 /dist
+/driver/build

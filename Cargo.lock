@@ -82,6 +82,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundsight-71-setup"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "soundsight-rs"
 version = "0.1.0"
 dependencies = [

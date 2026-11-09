@@ -77,6 +77,15 @@ playing the sound, and it works the same with a YouTube video.
 
 ---
 
+## Optional: SoundSight 7.1 virtual speakers (in development)
+
+`driver/` and `setup/` build a virtual 7.1 output device plus a one-file
+`SoundSight71Setup.exe`, so games can output 7.1 to SoundSight without Voicemeeter
+or VB-Cable. It is **test-signed only** for now and won't load with anti-cheat
+games until it is signed by Microsoft. See [driver/README.md](driver/README.md).
+
+---
+
 ## Build (Windows 10/11, stable Rust)
 
 1. Install Rust: <https://rustup.rs> (stable toolchain, default MSVC host).

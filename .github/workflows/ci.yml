@@ -18,7 +18,9 @@ jobs:
           components: clippy
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy -p soundsight-71-setup --all-targets -- -D warnings
       - name: Tests
         run: cargo test
       - name: Benchmarks (DSP + pipeline)
@@ -64,3 +66,58 @@ jobs:
           gh release delete latest --yes --cleanup-tag 2>$null
           $notes = "Built from ${{ github.ref_name }} @ ${{ github.sha }}. Single exe: download SoundSight.exe and run it. No install, no runtime needed."
           gh release create latest target/release/SoundSight.exe --title "SoundSight (latest build)" --notes $notes --prerelease --target ${{ github.sha }}
+
+  # The SoundSight 7.1 virtual speaker driver + its one-file setup.
+  # TEST-SIGNED: it only loads on a PC with test signing on, so it is uploaded as a
+  # build artifact and NOT published on the release. See driver/README.md.
+  driver:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch Microsoft's audio driver sample (pinned commit)
+        shell: pwsh
+        run: |
+          $sha = (Get-Content driver/WDS_COMMIT).Trim()
+          $wds = "driver/build/wds"
+          git init -q $wds
+          git -C $wds remote add origin https://github.com/microsoft/Windows-driver-samples
+          git -C $wds sparse-checkout set audio/simpleaudiosample
+          git -C $wds fetch -q --depth 1 --filter=blob:none origin $sha
+          git -C $wds checkout -q FETCH_HEAD
+
+      - name: Patch it into the SoundSight 7.1 driver
+        run: python driver/prepare.py driver/build/wds driver/build/src
+
+      - name: Install the WDK (NuGet)
+        run: nuget restore driver/build/src/packages.config -PackagesDirectory driver/build/src/packages
+
+      - name: Build the driver package (test-signed)
+        run: msbuild driver/build/src/simpleaudiosample/SimpleAudioSample.sln -m -nologo -clp:Verbosity=m -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10
+
+      - name: Collect the driver package
+        shell: pwsh
+        run: |
+          $cat = Get-ChildItem driver/build/src -Recurse -Filter *.cat | Select-Object -First 1
+          if (-not $cat) { Write-Error "No .cat produced"; exit 1 }
+          $out = New-Item -ItemType Directory -Force driver/build/package
+          Get-ChildItem $cat.DirectoryName -File | Where-Object { $_.Extension -in '.inf', '.sys', '.cat' } | Copy-Item -Destination $out
+          Get-ChildItem $cat.DirectoryName/.. -Recurse -Filter *.cer | Select-Object -First 1 | Copy-Item -Destination $out/SoundSight71-TestCert.cer
+          Copy-Item driver/build/src/LICENSE $out/LICENSE-MS-PL.txt
+          Get-ChildItem $out | Format-Table Name, Length
+          if (-not (Get-ChildItem $out -Filter *.inf)) { Write-Error "No .inf in package"; exit 1 }
+          if (-not (Get-ChildItem $out -Filter *.sys)) { Write-Error "No .sys in package"; exit 1 }
+
+      - name: Build SoundSight71Setup.exe (driver embedded)
+        shell: pwsh
+        run: |
+          $env:SOUNDSIGHT_DRIVER_DIR = (Resolve-Path driver/build/package).Path
+          cargo build --release -p soundsight-71-setup
+          Copy-Item target/release/SoundSight71Setup.exe driver/build/package/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SoundSight71-driver-TESTSIGNED
+          path: driver/build/package
+          if-no-files-found: error

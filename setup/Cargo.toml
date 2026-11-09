@@ -1,0 +1,18 @@
+[package]
+name = "soundsight-71-setup"
+version = "0.1.0"
+edition = "2021"
+description = "Installs/uninstalls the SoundSight 7.1 virtual speaker driver"
+build = "build.rs"
+
+[[bin]]
+name = "SoundSight71Setup"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_UI_WindowsAndMessaging",
+]

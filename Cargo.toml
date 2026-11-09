@@ -6,6 +6,11 @@ description = "Visual sound radar overlay for deaf and hard-of-hearing gamers (W
 default-run = "SoundSight"
 build = "build.rs"
 
+[workspace]
+# `cargo build`/`test` in the repo root still only touch SoundSight itself;
+# the driver installer is built with `-p soundsight-71-setup`.
+members = ["setup"]
+
 [lib]
 name = "soundsight"
 path = "src/lib.rs"
