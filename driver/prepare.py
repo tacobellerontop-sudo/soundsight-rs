@@ -74,12 +74,19 @@ def main() -> None:
         r"#define g_cCaptureEndpoints \(SIZEOF_ARRAY\(g_CaptureEndpoints\)\)",
         "#define g_cCaptureEndpoints 0 // SoundSight: render-only device",
     )
+    # The capture loop now never runs; the WDK builds with C4296 as an error.
+    edit(
+        src / "Main" / "adapter.cpp",
+        r"(\n)([ \t]*)(for \(ULONG i = 0; i < g_cCaptureEndpoints;)",
+        r"\g<1>\g<2>#pragma warning(suppress: 4296)\n\g<2>\g<3>",
+    )
 
     # --- INF: names, hardware ID, no mic interfaces ---------------------------
     inx = src / "Main" / "SimpleAudioSample.inx"
     enc = "utf-16"  # the sample's INX is UTF-16 with a BOM
     edit(inx, r"ROOT\\SimpleAudioSample", HARDWARE_ID.replace("\\", "\\\\"), enc)
     edit(inx, r"AddInterface=%KSCATEGORY_\w+%,\s*%KSNAME_\w+MicArray1%[^\r\n]*\r?\n", "", enc, count=5)
+    edit(inx, r"(?s)\[SIMPLEAUDIOSAMPLE\.I\.WaveMicArray1\].*?(?=;=+\r?\n; render interfaces)", "", enc)
     edit(inx, r"AddService=SimpleAudioSample,", "AddService=SoundSight71,", enc)
     edit(inx, r"KmdfService = SimpleAudioSample,", "KmdfService = SoundSight71,", enc)
     strings = {
