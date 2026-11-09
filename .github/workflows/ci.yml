@@ -93,6 +93,8 @@ jobs:
       - name: Install the WDK (NuGet)
         run: nuget restore driver/build/src/packages.config -PackagesDirectory driver/build/src/packages
 
+      - uses: microsoft/setup-msbuild@v2
+
       - name: Build the driver package (test-signed)
         run: msbuild driver/build/src/simpleaudiosample/SimpleAudioSample.sln -m -nologo -clp:Verbosity=m -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10
 
