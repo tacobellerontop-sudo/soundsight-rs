@@ -49,6 +49,10 @@ def main() -> None:
     for f in ("packages.config", "Directory.Build.props", "LICENSE"):
         shutil.copy2(wds / f, out / f)
 
+    # Make the WDK NuGet imports independent of the directory msbuild runs from.
+    props = out / "Directory.Build.props"
+    edit(props, r"(?<=['\"])packages\\", r"$(MSBuildThisFileDirectory)packages\\", count=10)
+
     src = out / "simpleaudiosample" / "Source"
 
     # --- 7.1 speaker endpoint ------------------------------------------------

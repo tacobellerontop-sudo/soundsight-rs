@@ -95,9 +95,12 @@ jobs:
         run: nuget restore driver/build/src/packages.config -PackagesDirectory driver/build/src/packages
 
       - uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
 
       - name: Build the driver package (test-signed)
-        run: msbuild driver/build/src/simpleaudiosample/SimpleAudioSample.sln -m -nologo -clp:Verbosity=m -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10
+        working-directory: driver/build/src
+        run: msbuild simpleaudiosample/SimpleAudioSample.sln -m -nologo -clp:Verbosity=m -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10
 
       - name: Collect the driver package
         shell: pwsh
