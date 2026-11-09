@@ -109,7 +109,7 @@ jobs:
           if (-not $cat) { Write-Error "No .cat produced"; exit 1 }
           $out = New-Item -ItemType Directory -Force driver/build/package
           Get-ChildItem $cat.DirectoryName -File | Where-Object { $_.Extension -in '.inf', '.sys', '.cat' } | Copy-Item -Destination $out
-          Get-ChildItem $cat.DirectoryName/.. -Recurse -Filter *.cer | Select-Object -First 1 | Copy-Item -Destination $out/SoundSight71-TestCert.cer
+          Get-ChildItem (Split-Path $cat.DirectoryName) -Recurse -Filter *.cer | Select-Object -First 1 | Copy-Item -Destination $out/SoundSight71-TestCert.cer
           Copy-Item driver/build/src/LICENSE $out/LICENSE-MS-PL.txt
           Get-ChildItem $out | Format-Table Name, Length
           if (-not (Get-ChildItem $out -Filter *.inf)) { Write-Error "No .inf in package"; exit 1 }
