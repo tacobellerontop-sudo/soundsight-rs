@@ -71,6 +71,10 @@ playing the sound, and it works the same with a YouTube video.
 - **Settings window** (click the tray icon): style, colour, opacity, sizes, sensitivity,
   fade time, own-sound filter, hotkey picker, start with Windows, and a live
   per-channel **speaker test** meter. Changes apply instantly and save automatically.
+- **7.1 surround setup** (button in Settings): optional, guided setup of Voicemeeter
+  Banana (free, by VB-Audio) so games output full 7.1. SoundSight doesn't bundle it: it
+  detects an existing install or opens VB-Audio's official download page, then walks you
+  through the Windows sound settings.
 - **Tray menu:** Settings & speaker test, Show overlay, Reload config file, Quit.
 - **Config file:** `soundsight.toml` next to the exe (written by the Settings window;
   editing it by hand is optional).
