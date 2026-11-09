@@ -172,7 +172,7 @@ fn for_each_device(mut f: impl FnMut(HDEVINFO, &SP_DEVINFO_DATA)) {
         if unsafe { SetupDiGetDeviceRegistryPropertyW(set, &data, SPDRP_HARDWAREID, None, Some(&mut buf), None) }.is_err() {
             continue;
         }
-        let ids: Vec<u16> = buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let ids: Vec<u16> = buf.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
         let matches = ids
             .split(|&c| c == 0)
             .take_while(|s| !s.is_empty())
