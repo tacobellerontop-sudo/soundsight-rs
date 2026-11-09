@@ -2,5 +2,6 @@
 pub mod app;
 pub mod overlay;
 pub mod settings;
+pub mod surround;
 pub mod tray;
 pub mod util;

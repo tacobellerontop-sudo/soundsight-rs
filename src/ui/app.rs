@@ -544,6 +544,15 @@ impl App {
     fn settings_control(&mut self, id: i32, code: u32) {
         match id {
             settings::ID_CLOSE => return self.close_settings(),
+            settings::ID_SURROUND => {
+                let owner = HWND(SETTINGS_HWND.load(Relaxed) as _);
+                let channels = if self.shared.capturing.load(Relaxed) {
+                    self.shared.channels.load(Relaxed)
+                } else {
+                    0
+                };
+                return super::surround::guided_setup(owner, channels);
+            }
             settings::ID_OPENCFG => {
                 self.save_now();
                 return self.edit_config();

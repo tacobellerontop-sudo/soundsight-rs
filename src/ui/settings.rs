@@ -53,6 +53,7 @@ const ID_POWERSAVE: i32 = 133;
 pub const ID_DEFAULTS: i32 = 140;
 pub const ID_OPENCFG: i32 = 141;
 pub const ID_CLOSE: i32 = 142;
+pub const ID_SURROUND: i32 = 143;
 
 // Layout, in 96-DPI units (scaled at creation).
 const CLIENT_W: i32 = 840;
@@ -470,6 +471,14 @@ impl SettingsWindow {
             RIGHT_X + RIGHT_W - 96,
             by + 132,
             96,
+        );
+        self.button(
+            hinst,
+            "7.1 surround setup...",
+            ID_SURROUND,
+            RIGHT_X,
+            by + 132,
+            170,
         );
         let hint = "Changes apply immediately and are saved automatically.";
         self.label(hinst, hint, -1, RIGHT_X, by + 40, RIGHT_W);
